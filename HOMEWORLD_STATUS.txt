@@ -12,22 +12,29 @@ SEALED
 - Batch 3D Rest / Sleep
 - Batch 3C.1 Achievement Hotfix
 - Batch 3E Forest Foraging
+- Batch 3F Farming Foundation
 
 Batch 3E final review
 - ChatGPT integration review/tests: PASS
 - DeepSeek independent review: PASS
 - Blockers: none
 - Non-blocking notes: 3 (no regression / no required change)
-- Deployment decision: HOLD; continue accumulating sealed batches before the next Cloudflare deployment.
 
-Batch 3F Farming Foundation — DESIGN STATUS
-- Spec v1.0: SEALED FOR IMPLEMENTATION
-- ChatGPT design review: PASS
-- DeepSeek adversarial design review: PASS
+Batch 3F final review
+- Spec v1.0: SEALED
+- ChatGPT implementation/tests: PASS
+- Test groups: 35/35 PASS
+- Worker syntax: PASS
+- Migration 0004 repeat-apply/idempotency: PASS
+- End-to-end farming flow: PASS (buy seed -> plant -> sleep/day advance -> water -> mature -> harvest -> sell)
+- DeepSeek adversarial implementation review: PASS
 - Blockers: none
-- DeepSeek non-blocking notes: 5; all incorporated into spec v1.0
-- Implementation: NOT STARTED / NOT SEALED
-- Cloudflare deployment: HOLD
+- Non-blocking notes: 4; no mandatory code/spec edits
+- DeepSeek N1 verification: PASS; real staging exports.SEASON_CN and shop seed rendering is safe
+- DeepSeek N2 decision: keep mature-before-already-watered rejection priority; intentional product behavior
+- Recommendation: READY FOR FINAL SEAL
+- Final decision: SEALED
+- Cloudflare deployment: HOLD until explicit deployment step
 
 KNOWN ISSUE #001 — RESOLVED IN SEALED STAGING
 The production Batch 3C baseline defines but does not unlock:
@@ -37,7 +44,7 @@ The production Batch 3C baseline defines but does not unlock:
 - codex_12
 Batch 3C.1 fixes this issue and includes historical backfill on the next successful catch.
 
-Canonical collaboration files
+Canonical collaboration files already in repository
 - homeworld-batch3c-worker.txt : current production/sealed Batch 3C baseline
 - homeworld-init.sql : schema + seed + migration 0002
 - homeworld-batch3c1-staging.txt : sealed Batch 3D + Batch 3C.1 baseline for later staged work
@@ -45,9 +52,13 @@ Canonical collaboration files
 - homeworld-migration-0003-foraging.sql : SEALED Batch 3E migration
 - BATCH3E_REVIEW_REQUEST.txt : Batch 3E independent review record/request
 
-Prepared Batch 3F design artifacts (not yet committed)
+Prepared Batch 3F artifacts (generated/reviewed; large Worker not yet committed through connector)
 - BATCH3F_FARMING_SPEC_v1.0_SEALED.txt
 - BATCH3F_IMPLEMENTATION_ORDER.txt
+- homeworld-batch3f-staging.txt
+- homeworld-migration-0004-farming.sql
+- BATCH3F_TEST_REPORT.txt
+- BATCH3F_IMPLEMENTATION_REVIEW_PACKET.txt
 
 Important rules
 - Offline world pauses.
