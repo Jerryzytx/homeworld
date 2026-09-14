@@ -2,8 +2,8 @@ Homeworld / 家机小世界 — Collaboration Status
 
 Repository owner: Jerryzytx
 Production deployment: Cloudflare Worker + D1
-Production baseline currently deployed: Batch 3C
-Cloudflare deployment changes: HOLD
+Production baseline currently deployed: Batch 3F
+Cloudflare deployment changes: COMPLETE for Batch 3F; pause further feature work
 
 SEALED
 - Batch 3A
@@ -32,33 +32,43 @@ Batch 3F final review
 - Non-blocking notes: 4; no mandatory code/spec edits
 - DeepSeek N1 verification: PASS; real staging exports.SEASON_CN and shop seed rendering is safe
 - DeepSeek N2 decision: keep mature-before-already-watered rejection priority; intentional product behavior
-- Recommendation: READY FOR FINAL SEAL
 - Final decision: SEALED
-- Cloudflare deployment: HOLD until explicit deployment step
 
-KNOWN ISSUE #001 — RESOLVED IN SEALED STAGING
-The production Batch 3C baseline defines but does not unlock:
+Batch 3F production deployment
+- Deployment date: 2026-09-14
+- D1 migration 0003 + 0004 applied successfully
+- Migration verification: forage_definitions=8, crop_definitions=8, seed items=8, crop items=8, farming achievements=2
+- Worker deployment: PASS; production home page reports Phase 1 · Batch 3F
+- /healthz: PASS
+- /healthz/db: PASS (fish_species=12; world state readable)
+- Live farming smoke test: PASS (buy seed -> move to farm -> plant successfully)
+- Production baseline is now Batch 3F
+- Further feature development intentionally paused for a few days
+
+KNOWN ISSUE #001 — RESOLVED IN PRODUCTION
+The old Batch 3C production baseline defined but did not unlock:
 - first_ss
 - first_trophy
 - codex_6
 - codex_12
-Batch 3C.1 fixes this issue and includes historical backfill on the next successful catch.
+Batch 3C.1 fixed this issue and the fix is now included in the deployed Batch 3F production Worker.
 
 Canonical collaboration files already in repository
-- homeworld-batch3c-worker.txt : current production/sealed Batch 3C baseline
+- homeworld-batch3c-worker.txt : historical Batch 3C production baseline
 - homeworld-init.sql : schema + seed + migration 0002
-- homeworld-batch3c1-staging.txt : sealed Batch 3D + Batch 3C.1 baseline for later staged work
-- homeworld-batch3e-staging.txt : SEALED Batch 3E Worker candidate (not yet deployed)
+- homeworld-batch3c1-staging.txt : sealed Batch 3D + Batch 3C.1 baseline
+- homeworld-batch3e-staging.txt : sealed Batch 3E baseline used to build 3F
 - homeworld-migration-0003-foraging.sql : SEALED Batch 3E migration
 - BATCH3E_REVIEW_REQUEST.txt : Batch 3E independent review record/request
 
 Prepared Batch 3F artifacts (generated/reviewed; large Worker not yet committed through connector)
 - BATCH3F_FARMING_SPEC_v1.0_SEALED.txt
 - BATCH3F_IMPLEMENTATION_ORDER.txt
-- homeworld-batch3f-staging.txt
+- homeworld-batch3f-staging.txt : exact Worker deployed to production manually through Cloudflare Dashboard
 - homeworld-migration-0004-farming.sql
 - BATCH3F_TEST_REPORT.txt
 - BATCH3F_IMPLEMENTATION_REVIEW_PACKET.txt
+- HOMEWORLD_DEPLOY_TO_BATCH3F_DASHBOARD_SAFE.sql : dashboard-safe combined migration 0003 + 0004 used for production deployment
 
 Important rules
 - Offline world pauses.
