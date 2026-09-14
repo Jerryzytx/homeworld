@@ -20,6 +20,15 @@ Batch 3E final review
 - Non-blocking notes: 3 (no regression / no required change)
 - Deployment decision: HOLD; continue accumulating sealed batches before the next Cloudflare deployment.
 
+Batch 3F Farming Foundation — DESIGN STATUS
+- Spec v1.0: SEALED FOR IMPLEMENTATION
+- ChatGPT design review: PASS
+- DeepSeek adversarial design review: PASS
+- Blockers: none
+- DeepSeek non-blocking notes: 5; all incorporated into spec v1.0
+- Implementation: NOT STARTED / NOT SEALED
+- Cloudflare deployment: HOLD
+
 KNOWN ISSUE #001 — RESOLVED IN SEALED STAGING
 The production Batch 3C baseline defines but does not unlock:
 - first_ss
@@ -35,6 +44,10 @@ Canonical collaboration files
 - homeworld-batch3e-staging.txt : SEALED Batch 3E Worker candidate (not yet deployed)
 - homeworld-migration-0003-foraging.sql : SEALED Batch 3E migration
 - BATCH3E_REVIEW_REQUEST.txt : Batch 3E independent review record/request
+
+Prepared Batch 3F design artifacts (not yet committed)
+- BATCH3F_FARMING_SPEC_v1.0_SEALED.txt
+- BATCH3F_IMPLEMENTATION_ORDER.txt
 
 Important rules
 - Offline world pauses.
