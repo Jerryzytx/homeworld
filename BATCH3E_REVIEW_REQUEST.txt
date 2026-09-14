@@ -1,0 +1,83 @@
+Homeworld / 家机小世界 — Batch 3E Final Independent Review Request
+
+STATUS
+- Baseline: Batch 3C.1 FINAL SEALED
+- Batch 3E: staging candidate, NOT SEALED
+- Cloudflare deployment: HOLD
+- Do not implement a new Worker. Review the actual staging only.
+
+FILES
+1. Batch 3E staging Worker
+https://github.com/Jerryzytx/homeworld/blob/main/homeworld-batch3e-staging.txt
+
+2. Migration 0003
+https://github.com/Jerryzytx/homeworld/blob/main/homeworld-migration-0003-foraging.sql
+
+3. Current project status
+https://github.com/Jerryzytx/homeworld/blob/main/HOMEWORLD_STATUS.txt
+
+CHATGPT INTEGRATION NOTES
+DeepSeek's first 3E delivery contained several issues that were corrected during integration against the real sealed staging:
+
+A. Real formHtml is positional:
+formHtml(actorParam, action, params, requestId, label, disabled = false)
+The object-style calls from the delivery were NOT merged.
+
+B. forest localization was added to both action/page locCn helpers:
+forest -> 森林
+
+C. Forage definition validation was strengthened.
+selectForageDefinitions uses LEFT JOIN and does NOT filter invalid item types away.
+Runtime validation requires the referenced item to exist and item_type === 'forage', so corrupt definitions fail fast instead of silently disappearing.
+
+D. Type-layer/circular dependency from the proposed TS delta was avoided.
+The bundled staging parses/validates forage definition rows locally in the actions module; players only owns SQL statement builders.
+
+ACTUAL TESTS EXECUTED BY CHATGPT
+PASS:
+- JS syntax/module load
+- Migration M1-M7, including applying migration twice
+- Forage F1-F14
+- Sell S1-S10
+- Concurrency C1-C3 coverage
+- Regression R1-R14
+- UI smoke for forest navigation / forest localization / forage action
+- Config fail-fast test for a forage definition whose item type is corrupted
+- /watch x10 read-only with forage inventory visible
+- mouse forage 403
+- mouse sell_all_forage 403
+- invalid UUID no mutation
+- ledger old reasons + sell_forage rendering
+
+Key actual assertions included:
+- 04:50 forage uses old context and ends at 05:05 with exactly one weather reroll
+- Spring D28 04:50 forage can use spring candidates and ends Summer D1 05:05
+- sell_all_forage leaves bait/fish/other-player inventory untouched
+- sell+sell race gives gold exactly once; retry recomputes second request as rejected_nothing_to_sell
+- current SS/Trophy and historical achievement backfill remain correct
+
+SECURITY CHECK
+No real ACCESS_TOKEN, API key, password, cookie, or D1 dump was added to the staging/migration files.
+
+PLEASE REVIEW ONLY
+Check:
+1. forest movement + localization
+2. forage context uses action-start season/time/weather
+3. RNG order find -> weighted pick -> quantity -> possible advanceTime weather RNG
+4. candidate/config fail-fast behavior
+5. inventory stack semantics
+6. sell_all_forage aggregate/scope/player isolation
+7. goldAfter / wallet balance_after source consistency
+8. rich_1000 / rich_10000 integration
+9. request-id idempotency + revision claim retry
+10. sell+sell stale-success -> rejected retry behavior
+11. /watch remains SELECT-only
+12. Batch 3D / 3C.1 sealed behavior not regressed
+13. migration idempotency and 8 frozen forage definitions
+14. any blocker missed by ChatGPT
+
+If no blocker, reply exactly with:
+NO BLOCKER
+READY FOR BATCH 3E FINAL SEAL
+
+Do not deploy Cloudflare.
