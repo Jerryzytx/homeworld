@@ -11,8 +11,16 @@ SEALED
 - Batch 3C
 - Batch 3D Rest / Sleep
 - Batch 3C.1 Achievement Hotfix
+- Batch 3E Forest Foraging
 
-KNOWN ISSUE #001 — RESOLVED IN STAGING
+Batch 3E final review
+- ChatGPT integration review/tests: PASS
+- DeepSeek independent review: PASS
+- Blockers: none
+- Non-blocking notes: 3 (no regression / no required change)
+- Deployment decision: HOLD; continue accumulating sealed batches before the next Cloudflare deployment.
+
+KNOWN ISSUE #001 — RESOLVED IN SEALED STAGING
 The production Batch 3C baseline defines but does not unlock:
 - first_ss
 - first_trophy
@@ -23,7 +31,10 @@ Batch 3C.1 fixes this issue and includes historical backfill on the next success
 Canonical collaboration files
 - homeworld-batch3c-worker.txt : current production/sealed Batch 3C baseline
 - homeworld-init.sql : schema + seed + migration 0002
-- homeworld-batch3c1-staging.txt : Batch 3C baseline + SEALED Batch 3D + Batch 3C.1 staging candidate
+- homeworld-batch3c1-staging.txt : sealed Batch 3D + Batch 3C.1 baseline for later staged work
+- homeworld-batch3e-staging.txt : SEALED Batch 3E Worker candidate (not yet deployed)
+- homeworld-migration-0003-foraging.sql : SEALED Batch 3E migration
+- BATCH3E_REVIEW_REQUEST.txt : Batch 3E independent review record/request
 
 Important rules
 - Offline world pauses.
