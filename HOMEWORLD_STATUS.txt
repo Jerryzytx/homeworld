@@ -10,11 +10,9 @@ SEALED
 - Batch 3B
 - Batch 3C
 - Batch 3D Rest / Sleep
-
-IN REVIEW
 - Batch 3C.1 Achievement Hotfix
 
-KNOWN ISSUE #001
+KNOWN ISSUE #001 — RESOLVED IN STAGING
 The production Batch 3C baseline defines but does not unlock:
 - first_ss
 - first_trophy
