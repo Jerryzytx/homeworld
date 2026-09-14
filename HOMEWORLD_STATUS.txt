@@ -1,0 +1,40 @@
+Homeworld / 家机小世界 — Collaboration Status
+
+Repository owner: Jerryzytx
+Production deployment: Cloudflare Worker + D1
+Production baseline currently deployed: Batch 3C
+Cloudflare deployment changes: HOLD
+
+SEALED
+- Batch 3A
+- Batch 3B
+- Batch 3C
+- Batch 3D Rest / Sleep
+
+IN REVIEW
+- Batch 3C.1 Achievement Hotfix
+
+KNOWN ISSUE #001
+The production Batch 3C baseline defines but does not unlock:
+- first_ss
+- first_trophy
+- codex_6
+- codex_12
+Batch 3C.1 fixes this issue and includes historical backfill on the next successful catch.
+
+Canonical collaboration files
+- homeworld-batch3c-worker.txt : current production/sealed Batch 3C baseline
+- homeworld-init.sql : schema + seed + migration 0002
+- homeworld-batch3c1-staging.txt : Batch 3C baseline + SEALED Batch 3D + Batch 3C.1 staging candidate
+
+Important rules
+- Offline world pauses.
+- Game-day boundary is 05:00.
+- sleep = next not-yet-reached 05:00.
+- home_gpt is shared by work_gpt and chat_gpt.
+- mouse is read-only and mutation requests return 403.
+- /watch is strict read-only.
+- mutations use request-id idempotency + global revision claim.
+
+Security
+Never commit real ACCESS_TOKEN values, API keys, cookies, passwords, .env secrets, or real D1 database exports.

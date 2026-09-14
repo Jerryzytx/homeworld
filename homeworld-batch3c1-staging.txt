@@ -1,0 +1,2646 @@
+// Homeworld Batch 3C — Cloudflare Dashboard single-file Worker
+// Generated from the reviewed/sealed TypeScript source.
+// D1 binding required: DB
+// Secret required: ACCESS_TOKEN
+
+const __modules = {
+"./actions": (module, exports, require) => {
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.loadSnapshot = loadSnapshot;
+exports.runAction = runAction;
+const world_1 = require("./world");
+const fishing_1 = require("./fishing");
+const Q = __importStar(require("./players"));
+async function loadSnapshot(env, actor, playerId) {
+    const worldRow = await Q.toPrepared(env.DB, Q.selectWorldState())
+        .first();
+    if (!worldRow)
+        throw new Error("world_state missing");
+    const playerRow = await Q.toPrepared(env.DB, Q.selectPlayerState(playerId))
+        .first();
+    if (!playerRow)
+        throw new Error(`player_state missing for ${playerId}`);
+    const walletRow = await Q.toPrepared(env.DB, Q.selectWallet(playerId))
+        .first();
+    if (!walletRow)
+        throw new Error(`wallet missing for ${playerId}`);
+    const invRows = await Q.toPrepared(env.DB, Q.selectInventoryStacks(playerId))
+        .all();
+    const inventory = new Map();
+    for (const r of invRows.results ?? [])
+        inventory.set(r.item_id, r.quantity);
+    const snap = Q.rowToWorldStateSnapshot(worldRow);
+    return {
+        actor,
+        playerId,
+        nowMs: Date.now(),
+        world: snap.state,
+        revision: snap.revision,
+        stamina: playerRow.stamina,
+        maxStamina: playerRow.max_stamina,
+        location: playerRow.location,
+        gold: walletRow.gold,
+        inventory,
+    };
+}
+function buildMove(snap, target, requestId, rng) {
+    if (!VALID_LOCATIONS.has(target)) {
+        return buildRejected(snap, "move", requestId, "rejected_location", `不认识的地方：${target}`);
+    }
+    if (snap.location === target) {
+        return buildRejected(snap, "move", requestId, "rejected_same_location", `已经在${locCn(target)}了。`);
+    }
+    const newWorld = (0, world_1.advanceTime)(snap.world, MOVE_MINUTES, rng).state;
+    const result = {
+        ok: true,
+        action: "move",
+        code: "moved",
+        summary: `从${locCn(snap.location)}走到了${locCn(target)}。`,
+        locationAfter: target,
+        staminaAfter: snap.stamina,
+        gameTimeAfter: newWorld.gameMinuteOfDay,
+    };
+    const statements = [
+        Q.insertActionRequest({
+            requestId,
+            actorId: snap.actor,
+            playerId: snap.playerId,
+            action: "move",
+            resultJson: JSON.stringify(result),
+            stateRevisionBefore: snap.revision,
+            createdAt: snap.nowMs,
+        }),
+        Q.setLocation(snap.playerId, target, snap.nowMs),
+        Q.updateWorldState(newWorld, snap.nowMs),
+        Q.insertActionLog({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            action: "move",
+            location: snap.location,
+            summary: result.summary,
+            details: JSON.stringify({ to: target }),
+            gameYear: snap.world.year,
+            season: snap.world.season,
+            gameDay: snap.world.gameDay,
+            gameTime: snap.world.gameMinuteOfDay,
+            worldDayIndex: snap.world.worldDayIndex,
+            createdAt: snap.nowMs,
+        }),
+        // ON CONFLICT DO NOTHING, so no read is needed.
+        Q.insertPlayerAchievement(snap.playerId, "first_action", snap.nowMs, snap.world.worldDayIndex, snap.world.gameMinuteOfDay),
+    ];
+    return { result, statements };
+}
+const VALID_LOCATIONS = new Set(["home", "river", "shop"]);
+const VALID_BAITS = new Set(["worm", "dough"]);
+const BAIT_IDS = ["worm", "dough"];
+const BAIT_CN = { worm: "蚯蚓", dough: "面团" };
+const BITE_RATE = 0.70;
+const CAST_STAMINA = 4;
+const CAST_MINUTES = 20;
+const MOVE_MINUTES = 10;
+const SHOP_MINUTES = 5;
+const BAIT_PACK_SIZE = 10;
+const REST_MINUTES = 60;
+const REST_STAMINA_RECOVERY = 20;
+const RICH_THRESHOLD_1 = 1000;
+const RICH_THRESHOLD_2 = 10000;
+async function buildCast(env, snap, baitId, requestId, rng) {
+    if (snap.location !== "river") {
+        return buildRejected(snap, "cast_rod", requestId, "rejected_location", `${locCn(snap.location)}没有水，抛不了竿。`);
+    }
+    if (!VALID_BAITS.has(baitId)) {
+        return buildRejected(snap, "cast_rod", requestId, "rejected_bait_id", `不认识这种鱼饵：${baitId}`);
+    }
+    const baitCount = snap.inventory.get(baitId) ?? 0;
+    if (baitCount < 1) {
+        return buildRejected(snap, "cast_rod", requestId, "rejected_bait", `没有${BAIT_CN[baitId]}了。`);
+    }
+    if (snap.stamina < CAST_STAMINA) {
+        return buildRejected(snap, "cast_rod", requestId, "rejected_stamina", "体力不足，抛不动竿了。");
+    }
+    const startSeason = snap.world.season;
+    const startWeather = snap.world.weather;
+    const startTimeOfDay = (0, world_1.getTimeOfDay)(snap.world.gameMinuteOfDay);
+    const startLocation = snap.location;
+    const startGameDay = snap.world.gameDay;
+    const startGameTime = snap.world.gameMinuteOfDay;
+    const startYear = snap.world.year;
+    const startWdi = snap.world.worldDayIndex;
+    const speciesRows = await Q.toPrepared(env.DB, Q.selectAllFishSpecies())
+        .all();
+    const speciesAll = (speciesRows.results ?? []).map(Q.rowToFishSpecies);
+    const modRows = await Q.toPrepared(env.DB, Q.selectAllBaitModifiers())
+        .all();
+    const mods = (modRows.results ?? []).map(Q.rowToBaitModifier);
+    const matrix = (0, fishing_1.validateBaitMatrix)(speciesAll, BAIT_IDS, mods);
+    if (matrix.missing.length > 0 || matrix.extra.length > 0) {
+        throw new Error(`bait matrix invalid: missing=${matrix.missing.length}, extra=${matrix.extra.length}`);
+    }
+    const bit = (0, fishing_1.rollBite)(rng, BITE_RATE);
+    let code = "miss";
+    let pickedSpecies = null;
+    let weightG = 0;
+    let grade = "C";
+    let price = 0;
+    if (bit) {
+        const candidates = (0, fishing_1.filterCandidates)(speciesAll, {
+            season: startSeason,
+            timeOfDay: startTimeOfDay,
+            weather: startWeather,
+            location: startLocation,
+        });
+        if (candidates.length === 0) {
+            code = "no_candidates";
+        }
+        else {
+            const weights = (0, fishing_1.computeSpawnWeights)(candidates, baitId, mods);
+            const picked = (0, fishing_1.pickWeightedSpecies)(rng, weights);
+            if (!picked) {
+                code = "no_candidates";
+            }
+            else {
+                const wg = (0, fishing_1.computeWeightAndGrade)(rng, picked);
+                pickedSpecies = picked;
+                weightG = wg.weightG;
+                grade = wg.grade;
+                price = (0, fishing_1.computePrice)(picked, wg.weightG, wg.grade);
+                code = "catch";
+            }
+        }
+    }
+    let isNewSpecies = false;
+    let isNewRecord = false;
+    let codexCountBefore = 0;
+    let historicalHasSS = false;
+    let historicalHasTrophy = false;
+    if (code === "catch" && pickedSpecies) {
+        const codexRow = await Q.toPrepared(env.DB, Q.selectCodexEntry(snap.playerId, pickedSpecies.id)).first();
+        if (!codexRow) {
+            isNewSpecies = true;
+            isNewRecord = true;
+        }
+        else {
+            isNewRecord = weightG > codexRow.max_weight_g;
+        }
+        const codexCountRow = await Q.toPrepared(env.DB, Q.selectCodexCount(snap.playerId)).first();
+        codexCountBefore = codexCountRow?.n ?? 0;
+        const gradeHistRow = await Q.toPrepared(env.DB, Q.selectFishingGradeHistory(snap.playerId)).first();
+        historicalHasSS = (gradeHistRow?.has_ss ?? 0) === 1;
+        historicalHasTrophy = (gradeHistRow?.has_trophy ?? 0) === 1;
+    }
+    let lockReason = null;
+    if (code === "catch") {
+        if (grade === "Trophy")
+            lockReason = "trophy";
+        else if (grade === "SS")
+            lockReason = "ss";
+        else if (isNewSpecies)
+            lockReason = "first_catch";
+        else if (isNewRecord)
+            lockReason = "record";
+    }
+    const isLocked = lockReason !== null;
+    const newWorld = (0, world_1.advanceTime)(snap.world, CAST_MINUTES, rng).state;
+    const staminaAfter = snap.stamina - CAST_STAMINA;
+    let result;
+    if (code === "catch" && pickedSpecies) {
+        result = {
+            ok: true,
+            action: "cast_rod",
+            code: "catch",
+            summary: `🎣 钓到了 ${pickedSpecies.name} ${formatWeight(weightG)}。`,
+            fish: {
+                speciesId: pickedSpecies.id,
+                name: pickedSpecies.name,
+                weightG,
+                grade,
+                price,
+                isNewSpecies,
+                isNewRecord,
+                isLocked,
+                lockReason,
+            },
+            staminaAfter,
+            gameTimeAfter: newWorld.gameMinuteOfDay,
+        };
+    }
+    else if (code === "miss") {
+        result = {
+            ok: true,
+            action: "cast_rod",
+            code: "miss",
+            summary: "水面很安静，什么也没有咬钩。",
+            staminaAfter,
+            gameTimeAfter: newWorld.gameMinuteOfDay,
+        };
+    }
+    else {
+        result = {
+            ok: true,
+            action: "cast_rod",
+            code: "no_candidates",
+            summary: "鱼漂晃了晃，但这片水域现在似乎没有鱼。",
+            staminaAfter,
+            gameTimeAfter: newWorld.gameMinuteOfDay,
+        };
+    }
+    let hasSSAfter = false;
+    let hasTrophyAfter = false;
+    let codexCountAfter = codexCountBefore;
+    if (code === "catch" && pickedSpecies) {
+        hasSSAfter = historicalHasSS || grade === "SS";
+        hasTrophyAfter = historicalHasTrophy || grade === "Trophy";
+        codexCountAfter = codexCountBefore + (isNewSpecies ? 1 : 0);
+    }
+    const statements = [
+        Q.insertActionRequest({
+            requestId,
+            actorId: snap.actor,
+            playerId: snap.playerId,
+            action: "cast_rod",
+            resultJson: JSON.stringify(result),
+            stateRevisionBefore: snap.revision,
+            createdAt: snap.nowMs,
+        }),
+        Q.ensureInventoryStack(snap.playerId, baitId, snap.nowMs),
+        Q.deductItem(snap.playerId, baitId, 1, snap.nowMs),
+        Q.deductStamina(snap.playerId, CAST_STAMINA, snap.nowMs),
+        Q.updateWorldState(newWorld, snap.nowMs),
+    ];
+    if (code === "catch" && pickedSpecies) {
+        statements.push(Q.insertFishCatch({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            speciesId: pickedSpecies.id,
+            weightG,
+            grade,
+            price,
+            isNewSpecies,
+            isNewRecord,
+            status: "inventory",
+            isFavorite: false,
+            isLocked,
+            lockReason,
+            soldAt: null,
+            location: startLocation,
+            baitId,
+            gameYear: startYear,
+            season: startSeason,
+            weather: startWeather,
+            gameDay: startGameDay,
+            gameTime: startGameTime,
+            worldDayIndex: startWdi,
+            requestId,
+            caughtAt: snap.nowMs,
+        }), Q.upsertCodex({
+            playerId: snap.playerId,
+            speciesId: pickedSpecies.id,
+            firstCaughtAt: snap.nowMs,
+            maxWeightG: weightG,
+            maxGrade: grade,
+        }));
+    }
+    statements.push(Q.insertActionLog({
+        playerId: snap.playerId,
+        actorId: snap.actor,
+        action: "cast_rod",
+        location: startLocation,
+        summary: result.summary,
+        details: JSON.stringify({ baitId, code }),
+        gameYear: startYear,
+        season: startSeason,
+        gameDay: startGameDay,
+        gameTime: startGameTime,
+        worldDayIndex: startWdi,
+        createdAt: snap.nowMs,
+    }), Q.insertPlayerAchievement(snap.playerId, "first_action", snap.nowMs, startWdi, startGameTime), Q.insertPlayerAchievement(snap.playerId, "first_cast", snap.nowMs, startWdi, startGameTime));
+    if (code === "catch") {
+        statements.push(Q.insertPlayerAchievement(snap.playerId, "first_fish", snap.nowMs, startWdi, startGameTime));
+    }
+    if (code === "catch" && pickedSpecies) {
+        if (hasSSAfter) {
+            statements.push(Q.insertPlayerAchievement(snap.playerId, "first_ss", snap.nowMs, startWdi, startGameTime));
+        }
+        if (hasTrophyAfter) {
+            statements.push(Q.insertPlayerAchievement(snap.playerId, "first_trophy", snap.nowMs, startWdi, startGameTime));
+        }
+        if (codexCountAfter >= 6) {
+            statements.push(Q.insertPlayerAchievement(snap.playerId, "codex_6", snap.nowMs, startWdi, startGameTime));
+        }
+        if (codexCountAfter >= 12) {
+            statements.push(Q.insertPlayerAchievement(snap.playerId, "codex_12", snap.nowMs, startWdi, startGameTime));
+        }
+    }
+    return { result, statements };
+}
+async function buildBuyBait(env, snap, itemId, quantityRaw, requestId, rng) {
+    if (snap.location !== "shop") {
+        return buildRejected(snap, "buy_bait", requestId, "rejected_location", `${locCn(snap.location)}没有商店。`);
+    }
+    // Phase 1 limitation: only the exact 10-item bait pack is accepted.
+    // Revisit when variable pack sizes or custom quantities are introduced.
+    if (quantityRaw !== String(BAIT_PACK_SIZE)) {
+        return buildRejected(snap, "buy_bait", requestId, "rejected_quantity", `只支持购买 ${BAIT_PACK_SIZE} 个一包。`);
+    }
+    if (!VALID_BAITS.has(itemId)) {
+        return buildRejected(snap, "buy_bait", requestId, "rejected_item_id", `不认识这种商品：${itemId}`);
+    }
+    const itemRow = await Q.toPrepared(env.DB, Q.selectItemDefinition(itemId))
+        .first();
+    if (!itemRow) {
+        return buildRejected(snap, "buy_bait", requestId, "rejected_item_missing", `商店里没有这种商品：${itemId}`);
+    }
+    if (itemRow.type !== "bait") {
+        return buildRejected(snap, "buy_bait", requestId, "rejected_item_type", `这种商品不能作为鱼饵购买：${itemRow.name}`);
+    }
+    // Phase 1 assumption: all purchasable items have a positive price.
+    // Revisit if free/system-gift items are introduced.
+    if (!Number.isInteger(itemRow.buy_price) || itemRow.buy_price <= 0) {
+        throw new Error(`invalid buy_price for ${itemId}: ${itemRow.buy_price}`);
+    }
+    const quantity = BAIT_PACK_SIZE;
+    const cost = itemRow.buy_price * quantity;
+    if (snap.gold < cost) {
+        return buildRejected(snap, "buy_bait", requestId, "rejected_gold", `金币不足，需要 ${cost}G，当前 ${snap.gold}G。`);
+    }
+    const newWorld = (0, world_1.advanceTime)(snap.world, SHOP_MINUTES, rng).state;
+    const goldAfter = snap.gold - cost;
+    const result = {
+        ok: true,
+        action: "buy_bait",
+        code: "purchased",
+        summary: `买了${itemRow.name}×${quantity}，花费${cost}G。`,
+        itemId,
+        quantity,
+        goldDelta: -cost,
+        goldAfter,
+        gameTimeAfter: newWorld.gameMinuteOfDay,
+    };
+    const statements = [
+        Q.insertActionRequest({
+            requestId,
+            actorId: snap.actor,
+            playerId: snap.playerId,
+            action: "buy_bait",
+            resultJson: JSON.stringify(result),
+            stateRevisionBefore: snap.revision,
+            createdAt: snap.nowMs,
+        }),
+        Q.deductGold(snap.playerId, cost, snap.nowMs),
+        Q.addItem(snap.playerId, itemId, quantity, snap.nowMs),
+        Q.updateWorldState(newWorld, snap.nowMs),
+        Q.insertWalletTransaction({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            delta: -cost,
+            balanceAfter: goldAfter,
+            reason: "buy_bait",
+            counterparty: null,
+            note: `${itemRow.name}×${quantity}`,
+            gameYear: snap.world.year,
+            season: snap.world.season,
+            gameDay: snap.world.gameDay,
+            gameTime: snap.world.gameMinuteOfDay,
+            worldDayIndex: snap.world.worldDayIndex,
+            createdAt: snap.nowMs,
+        }),
+        Q.insertActionLog({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            action: "buy_bait",
+            location: snap.location,
+            summary: result.summary,
+            details: JSON.stringify({ itemId, quantity, cost }),
+            gameYear: snap.world.year,
+            season: snap.world.season,
+            gameDay: snap.world.gameDay,
+            gameTime: snap.world.gameMinuteOfDay,
+            worldDayIndex: snap.world.worldDayIndex,
+            createdAt: snap.nowMs,
+        }),
+        Q.insertPlayerAchievement(snap.playerId, "first_action", snap.nowMs, snap.world.worldDayIndex, snap.world.gameMinuteOfDay),
+    ];
+    return { result, statements };
+}
+async function buildSellAllFish(env, snap, requestId, rng) {
+    if (snap.location !== "shop") {
+        return buildRejected(snap, "sell_all_fish", requestId, "rejected_location", "只能在商店卖鱼。");
+    }
+    const sumRow = await Q.toPrepared(env.DB, Q.selectSellableFishSummary(snap.playerId)).first();
+    const fishCount = sumRow?.fish_count ?? 0;
+    const totalPrice = sumRow?.total_price ?? 0;
+    if (fishCount === 0) {
+        return buildRejected(snap, "sell_all_fish", requestId, "rejected_nothing_to_sell", "没有可出售的鱼。");
+    }
+    // Phase 1 assumption: every sellable fish has a positive sell value.
+    // Revisit if zero-value junk/specimens are introduced.
+    if (!Number.isInteger(totalPrice) || totalPrice <= 0) {
+        throw new Error(`invalid sellable total price: ${totalPrice}`);
+    }
+    const newWorld = (0, world_1.advanceTime)(snap.world, SHOP_MINUTES, rng).state;
+    const goldAfter = snap.gold + totalPrice;
+    const result = {
+        ok: true,
+        action: "sell_all_fish",
+        code: "sold",
+        summary: `卖出了 ${fishCount} 条鱼，收入 ${totalPrice}G。`,
+        fishCount,
+        goldDelta: totalPrice,
+        goldAfter,
+        gameTimeAfter: newWorld.gameMinuteOfDay,
+    };
+    const statements = [
+        Q.insertActionRequest({
+            requestId,
+            actorId: snap.actor,
+            playerId: snap.playerId,
+            action: "sell_all_fish",
+            resultJson: JSON.stringify(result),
+            stateRevisionBefore: snap.revision,
+            createdAt: snap.nowMs,
+        }),
+        Q.sellAllSellableFish(snap.playerId, snap.nowMs),
+        Q.addGold(snap.playerId, totalPrice, snap.nowMs),
+        Q.updateWorldState(newWorld, snap.nowMs),
+        Q.insertWalletTransaction({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            delta: totalPrice,
+            balanceAfter: goldAfter,
+            reason: "sell_fish",
+            counterparty: null,
+            note: `${fishCount}条`,
+            gameYear: snap.world.year,
+            season: snap.world.season,
+            gameDay: snap.world.gameDay,
+            gameTime: snap.world.gameMinuteOfDay,
+            worldDayIndex: snap.world.worldDayIndex,
+            createdAt: snap.nowMs,
+        }),
+        Q.insertActionLog({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            action: "sell_all_fish",
+            location: snap.location,
+            summary: result.summary,
+            details: JSON.stringify({ fishCount, totalPrice }),
+            gameYear: snap.world.year,
+            season: snap.world.season,
+            gameDay: snap.world.gameDay,
+            gameTime: snap.world.gameMinuteOfDay,
+            worldDayIndex: snap.world.worldDayIndex,
+            createdAt: snap.nowMs,
+        }),
+        Q.insertPlayerAchievement(snap.playerId, "first_action", snap.nowMs, snap.world.worldDayIndex, snap.world.gameMinuteOfDay),
+    ];
+    if (goldAfter >= RICH_THRESHOLD_1) {
+        statements.push(Q.insertPlayerAchievement(snap.playerId, "rich_1000", snap.nowMs, snap.world.worldDayIndex, snap.world.gameMinuteOfDay));
+    }
+    if (goldAfter >= RICH_THRESHOLD_2) {
+        statements.push(Q.insertPlayerAchievement(snap.playerId, "rich_10000", snap.nowMs, snap.world.worldDayIndex, snap.world.gameMinuteOfDay));
+    }
+    return { result, statements };
+}
+function buildRest(snap, requestId, rng) {
+    if (snap.location !== "home") {
+        return buildRejected(snap, "rest", requestId, "rejected_wrong_location", "只能在屋子里休息。");
+    }
+    if (snap.stamina >= snap.maxStamina) {
+        return buildRejected(snap, "rest", requestId, "rejected_full_stamina", "体力已经满了，不需要休息。");
+    }
+    const advance = (0, world_1.advanceTime)(snap.world, REST_MINUTES, rng);
+    const newWorld = advance.state;
+    const staminaAfter = Math.min(snap.maxStamina, snap.stamina + REST_STAMINA_RECOVERY);
+    const result = {
+        ok: true,
+        action: "rest",
+        code: "rested",
+        summary: `休息了一小时。体力 ${snap.stamina} → ${staminaAfter}。`,
+        staminaBefore: snap.stamina,
+        staminaAfter,
+        minutesAdvanced: REST_MINUTES,
+        gameTimeAfter: newWorld.gameMinuteOfDay,
+    };
+    const statements = [
+        Q.insertActionRequest({
+            requestId,
+            actorId: snap.actor,
+            playerId: snap.playerId,
+            action: "rest",
+            resultJson: JSON.stringify(result),
+            stateRevisionBefore: snap.revision,
+            createdAt: snap.nowMs,
+        }),
+        Q.restoreStamina(snap.playerId, REST_STAMINA_RECOVERY, snap.nowMs),
+        Q.updateWorldState(newWorld, snap.nowMs),
+        Q.insertActionLog({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            action: "rest",
+            location: snap.location,
+            summary: result.summary,
+            details: JSON.stringify({
+                minutesAdvanced: REST_MINUTES,
+                staminaBefore: snap.stamina,
+                staminaAfter,
+            }),
+            gameYear: snap.world.year,
+            season: snap.world.season,
+            gameDay: snap.world.gameDay,
+            gameTime: snap.world.gameMinuteOfDay,
+            worldDayIndex: snap.world.worldDayIndex,
+            createdAt: snap.nowMs,
+        }),
+        Q.insertPlayerAchievement(snap.playerId, "first_action", snap.nowMs, snap.world.worldDayIndex, snap.world.gameMinuteOfDay),
+    ];
+    return { result, statements };
+}
+function buildSleep(snap, requestId, rng) {
+    if (snap.location !== "home") {
+        return buildRejected(snap, "sleep", requestId, "rejected_wrong_location", "只能在屋子里睡觉。");
+    }
+    const minutesToSleep = (0, world_1.minutesToNextDayBoundary)(snap.world.gameMinuteOfDay);
+    const advance = (0, world_1.advanceTime)(snap.world, minutesToSleep, rng);
+    if (advance.daysPassed !== 1 || advance.state.gameMinuteOfDay !== 300) {
+        throw new Error(`sleep invariant failed: daysPassed=${advance.daysPassed}, minute=${advance.state.gameMinuteOfDay}`);
+    }
+    const newWorld = advance.state;
+    const staminaAfter = snap.maxStamina;
+    const result = {
+        ok: true,
+        action: "sleep",
+        code: "slept",
+        summary: "睡了一觉，现在是 05:00，体力回满。",
+        staminaBefore: snap.stamina,
+        staminaAfter,
+        minutesAdvanced: minutesToSleep,
+        gameTimeAfter: newWorld.gameMinuteOfDay,
+    };
+    const statements = [
+        Q.insertActionRequest({
+            requestId,
+            actorId: snap.actor,
+            playerId: snap.playerId,
+            action: "sleep",
+            resultJson: JSON.stringify(result),
+            stateRevisionBefore: snap.revision,
+            createdAt: snap.nowMs,
+        }),
+        Q.setStaminaFull(snap.playerId, snap.nowMs),
+        Q.updateWorldState(newWorld, snap.nowMs),
+        Q.insertActionLog({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            action: "sleep",
+            location: snap.location,
+            summary: result.summary,
+            details: JSON.stringify({
+                minutesAdvanced: minutesToSleep,
+                staminaBefore: snap.stamina,
+                staminaAfter,
+            }),
+            gameYear: snap.world.year,
+            season: snap.world.season,
+            gameDay: snap.world.gameDay,
+            gameTime: snap.world.gameMinuteOfDay,
+            worldDayIndex: snap.world.worldDayIndex,
+            createdAt: snap.nowMs,
+        }),
+        Q.insertPlayerAchievement(snap.playerId, "first_action", snap.nowMs, snap.world.worldDayIndex, snap.world.gameMinuteOfDay),
+    ];
+    return { result, statements };
+}
+function buildRejected(snap, action, requestId, code, message) {
+    const result = { ok: false, action, code, summary: message };
+    const statements = [
+        Q.insertActionRequest({
+            requestId,
+            actorId: snap.actor,
+            playerId: snap.playerId,
+            action,
+            resultJson: JSON.stringify(result),
+            stateRevisionBefore: null,
+            createdAt: snap.nowMs,
+        }),
+        Q.insertActionLog({
+            playerId: snap.playerId,
+            actorId: snap.actor,
+            action,
+            location: snap.location,
+            summary: `[拒绝] ${message}`,
+            details: JSON.stringify({ rejected: code }),
+            gameYear: snap.world.year,
+            season: snap.world.season,
+            gameDay: snap.world.gameDay,
+            gameTime: snap.world.gameMinuteOfDay,
+            worldDayIndex: snap.world.worldDayIndex,
+            createdAt: snap.nowMs,
+        }),
+    ];
+    return { result, statements };
+}
+async function runAction(env, params) {
+    const existing = await Q.toPrepared(env.DB, Q.selectActionRequest(params.requestId))
+        .first();
+    if (existing) {
+        return JSON.parse(existing.result_json);
+    }
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const snap = await loadSnapshot(env, params.actor, params.playerId);
+            const built = await dispatch(env, snap, params);
+            const prepared = built.statements.map((s) => Q.toPrepared(env.DB, s));
+            await env.DB.batch(prepared);
+            return built.result;
+        }
+        catch (err) {
+            lastErr = err;
+            const after = await Q.toPrepared(env.DB, Q.selectActionRequest(params.requestId))
+                .first();
+            if (after) {
+                return JSON.parse(after.result_json);
+            }
+            // Stale revision or another transactional race: re-read/recompute once.
+        }
+    }
+    throw lastErr ?? new Error("runAction failed after retry");
+}
+async function dispatch(env, snap, params) {
+    const { action, form, requestId, rng } = params;
+    if (action === "move") {
+        return buildMove(snap, form.to ?? "", requestId, rng);
+    }
+    if (action === "cast_rod") {
+        return buildCast(env, snap, form.bait_id ?? "worm", requestId, rng);
+    }
+    if (action === "buy_bait") {
+        return buildBuyBait(env, snap, form.item_id ?? "", form.quantity ?? "", requestId, rng);
+    }
+    if (action === "sell_all_fish") {
+        return buildSellAllFish(env, snap, requestId, rng);
+    }
+    if (action === "rest") {
+        return buildRest(snap, requestId, rng);
+    }
+    if (action === "sleep") {
+        return buildSleep(snap, requestId, rng);
+    }
+    return buildRejected(snap, action, requestId, "rejected_unknown_action", `不认识的动作：${action}`);
+}
+function locCn(loc) {
+    if (loc === "home")
+        return "小屋";
+    if (loc === "river")
+        return "河边";
+    if (loc === "shop")
+        return "商店";
+    return loc;
+}
+function formatWeight(g) {
+    if (g < 1000)
+        return `${g}g`;
+    return `${(g / 1000).toFixed(2)}kg`;
+}
+
+},
+"./auth": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.readCookie = readCookie;
+exports.isAuthorized = isAuthorized;
+exports.checkToken = checkToken;
+exports.sessionCookieHeader = sessionCookieHeader;
+const COOKIE_NAME = "hw_session";
+const COOKIE_MAX_AGE = 60 * 60 * 24 * 365; // 1 year
+function readCookie(req, name) {
+    const raw = req.headers.get("Cookie");
+    if (!raw)
+        return null;
+    for (const part of raw.split(";")) {
+        const trimmed = part.trim();
+        const eq = trimmed.indexOf("=");
+        if (eq < 0)
+            continue;
+        const key = trimmed.slice(0, eq);
+        if (key !== name)
+            continue;
+        const value = trimmed.slice(eq + 1);
+        try {
+            return decodeURIComponent(value);
+        }
+        catch {
+            return null;
+        }
+    }
+    return null;
+}
+function readBearer(req) {
+    const h = req.headers.get("Authorization");
+    if (!h)
+        return null;
+    const m = /^Bearer\s+(.+)$/i.exec(h);
+    return m ? m[1].trim() : null;
+}
+function constantTimeEqual(a, b) {
+    if (a.length !== b.length)
+        return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++)
+        diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+}
+function isAuthorized(req, env) {
+    const expected = env.ACCESS_TOKEN;
+    if (!expected)
+        return false;
+    const bearer = readBearer(req);
+    if (bearer && constantTimeEqual(bearer, expected))
+        return true;
+    const cookie = readCookie(req, COOKIE_NAME);
+    if (cookie && constantTimeEqual(cookie, expected))
+        return true;
+    return false;
+}
+function checkToken(token, env) {
+    if (!token || !env.ACCESS_TOKEN)
+        return false;
+    return constantTimeEqual(token, env.ACCESS_TOKEN);
+}
+function sessionCookieHeader(token, secure) {
+    const flags = [
+        `${COOKIE_NAME}=${encodeURIComponent(token)}`,
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        `Max-Age=${COOKIE_MAX_AGE}`,
+    ];
+    if (secure)
+        flags.push("Secure");
+    return flags.join("; ");
+}
+
+},
+"./db": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.now = now;
+exports.newRequestId = newRequestId;
+exports.parseJson = parseJson;
+exports.worldDayIndex = worldDayIndex;
+function now() {
+    return Date.now();
+}
+function newRequestId() {
+    return crypto.randomUUID();
+}
+function parseJson(text, fallback) {
+    if (!text)
+        return fallback;
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return fallback;
+    }
+}
+const SEASON_INDEX = {
+    spring: 0,
+    summer: 1,
+    autumn: 2,
+    winter: 3,
+};
+function worldDayIndex(year, season, gameDay) {
+    return (year - 1) * 112 + SEASON_INDEX[season] * 28 + gameDay;
+}
+
+},
+"./fishing": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.GRADE_MULTIPLIER = void 0;
+exports.rollBite = rollBite;
+exports.filterCandidates = filterCandidates;
+exports.computeSpawnWeights = computeSpawnWeights;
+exports.validateBaitMatrix = validateBaitMatrix;
+exports.pickWeighted = pickWeighted;
+exports.pickWeightedSpecies = pickWeightedSpecies;
+exports.gradeFromP = gradeFromP;
+exports.computeWeightAndGrade = computeWeightAndGrade;
+exports.computePrice = computePrice;
+function nextRandom(rng, label) {
+    const value = rng();
+    if (!Number.isFinite(value) || value < 0 || value >= 1) {
+        throw new Error(`${label}: rng must return a finite value in [0,1)`);
+    }
+    return value;
+}
+function rollBite(rng, biteRate) {
+    if (!Number.isFinite(biteRate))
+        throw new Error("rollBite: biteRate must be finite");
+    if (biteRate <= 0)
+        return false;
+    if (biteRate >= 1)
+        return true;
+    return nextRandom(rng, "rollBite") < biteRate;
+}
+function filterCandidates(species, ctx) {
+    return species.filter((s) => s.seasons.includes(ctx.season) &&
+        s.times.includes(ctx.timeOfDay) &&
+        s.weathers.includes(ctx.weather) &&
+        s.locations.includes(ctx.location));
+}
+/**
+ * weight = species.spawnWeight × bait multiplier。
+ * 架构约定为“全配无缺省”，因此缺配置是数据错误：直接抛错，不静默改概率。
+ */
+function computeSpawnWeights(candidates, baitId, modifiers) {
+    const modMap = new Map();
+    for (const m of modifiers) {
+        if (m.baitId === baitId)
+            modMap.set(m.speciesId, m.multiplier);
+    }
+    const out = [];
+    for (const s of candidates) {
+        const mult = modMap.get(s.id);
+        if (mult === undefined) {
+            throw new Error(`computeSpawnWeights: missing bait modifier for ${s.id}/${baitId}`);
+        }
+        const weight = s.spawnWeight * mult;
+        if (weight > 0)
+            out.push({ species: s, weight });
+    }
+    return out;
+}
+function validateBaitMatrix(species, baitIds, modifiers) {
+    const key = (s, b) => `${s}::${b}`;
+    const speciesIds = new Set(species.map((s) => s.id));
+    const baitSet = new Set(baitIds);
+    const present = new Set();
+    const extra = [];
+    for (const m of modifiers) {
+        const k = key(m.speciesId, m.baitId);
+        if (!speciesIds.has(m.speciesId) || !baitSet.has(m.baitId)) {
+            extra.push({ speciesId: m.speciesId, baitId: m.baitId });
+        }
+        else {
+            present.add(k);
+        }
+    }
+    const missing = [];
+    for (const s of species) {
+        for (const b of baitIds) {
+            if (!present.has(key(s.id, b))) {
+                missing.push({ speciesId: s.id, baitId: b });
+            }
+        }
+    }
+    return { missing, extra };
+}
+function pickWeighted(rng, items) {
+    if (items.length === 0)
+        return null;
+    const total = items.reduce((sum, x) => sum + x.weight, 0);
+    if (!Number.isFinite(total) || total <= 0)
+        return null;
+    let r = nextRandom(rng, "pickWeighted") * total;
+    for (const x of items) {
+        r -= x.weight;
+        if (r < 0)
+            return x.item;
+    }
+    return items[items.length - 1].item;
+}
+function pickWeightedSpecies(rng, items) {
+    return pickWeighted(rng, items.map((x) => ({ item: x.species, weight: x.weight })));
+}
+function gradeFromP(p) {
+    if (p < 0.5)
+        return "C";
+    if (p < 0.8)
+        return "B";
+    if (p < 0.95)
+        return "A";
+    if (p < 0.99)
+        return "S";
+    if (p < 0.999)
+        return "SS";
+    return "Trophy";
+}
+function computeWeightAndGrade(rng, species) {
+    const u = nextRandom(rng, "computeWeightAndGrade");
+    const p = Math.pow(u, species.weightSkew);
+    const raw = species.minWeightG + (species.maxWeightG - species.minWeightG) * p;
+    const weightG = Math.round(raw);
+    return { weightG, grade: gradeFromP(p), p };
+}
+exports.GRADE_MULTIPLIER = {
+    C: 1.0,
+    B: 1.15,
+    A: 1.4,
+    S: 2.0,
+    SS: 3.5,
+    Trophy: 6.0,
+};
+function computePrice(species, weightG, grade) {
+    const base = (species.pricePerKg * weightG) / 1000;
+    return Math.floor(base * exports.GRADE_MULTIPLIER[grade]);
+}
+
+},
+"./identity": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ACTOR_TO_PLAYER = exports.ACTORS = void 0;
+exports.isActor = isActor;
+exports.resolvePlayer = resolvePlayer;
+exports.ACTORS = ["work_gpt", "chat_gpt", "mouse"];
+exports.ACTOR_TO_PLAYER = {
+    work_gpt: "home_gpt",
+    chat_gpt: "home_gpt",
+    mouse: "mouse",
+};
+function isActor(value) {
+    return exports.ACTORS.includes(value);
+}
+function resolvePlayer(actor) {
+    return exports.ACTOR_TO_PLAYER[actor];
+}
+
+},
+"./index": (module, exports, require) => {
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+const identity_1 = require("./identity");
+const auth_1 = require("./auth");
+const rng_1 = require("./rng");
+const actions_1 = require("./actions");
+const pages_1 = require("./pages");
+const pages_watch_1 = require("./pages_watch");
+const Q = __importStar(require("./players"));
+function text(body, status = 200) {
+    return new Response(body, {
+        status,
+        headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+        },
+    });
+}
+function isRequestId(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+async function renderAiPageForActor(env, actor, playerId, result) {
+    const worldRow = await Q.toPrepared(env.DB, Q.selectWorldState())
+        .first();
+    if (!worldRow)
+        return text("world state missing", 500);
+    const world = Q.rowToWorldState(worldRow);
+    const playerRow = await Q.toPrepared(env.DB, Q.selectPlayerState(playerId))
+        .first();
+    if (!playerRow)
+        return text(`player state missing: ${playerId}`, 500);
+    const walletRow = await Q.toPrepared(env.DB, Q.selectWallet(playerId))
+        .first();
+    const gold = walletRow?.gold ?? 0;
+    const BAIT_NAME = { worm: "蚯蚓", dough: "面团" };
+    const baitRows = await Q.toPrepared(env.DB, Q.selectBaitStacks(playerId))
+        .all();
+    const baitMap = new Map();
+    for (const r of baitRows.results ?? [])
+        baitMap.set(r.item_id, r.quantity);
+    const baits = ["worm", "dough"].map((id) => ({
+        itemId: id,
+        name: BAIT_NAME[id],
+        quantity: baitMap.get(id) ?? 0,
+    }));
+    const recentRows = await Q.toPrepared(env.DB, Q.selectRecentCatches(playerId, 5))
+        .all();
+    const recent = (recentRows.results ?? []).map((r) => ({
+        name: r.species_name,
+        weightG: r.weight_g,
+        grade: r.grade,
+        price: r.price,
+        gameDay: r.game_day,
+        gameTime: r.game_time,
+    }));
+    let shopInfo = null;
+    if (playerRow.location === "shop") {
+        const sumRow = await Q.toPrepared(env.DB, Q.selectSellableFishSummary(playerId)).first();
+        const lockedRow = await Q.toPrepared(env.DB, Q.selectLockedFishCount(playerId)).first();
+        shopInfo = {
+            sellableCount: sumRow?.fish_count ?? 0,
+            sellablePrice: sumRow?.total_price ?? 0,
+            lockedCount: lockedRow?.n ?? 0,
+        };
+    }
+    const readOnly = playerId === "mouse";
+    const requestIds = readOnly
+        ? {}
+        : {
+            moveRiver: crypto.randomUUID(),
+            moveHome: crypto.randomUUID(),
+            moveShop: crypto.randomUUID(),
+            castWorm: crypto.randomUUID(),
+            castDough: crypto.randomUUID(),
+            buyWorm: crypto.randomUUID(),
+            buyDough: crypto.randomUUID(),
+            sellAll: crypto.randomUUID(),
+            rest: crypto.randomUUID(),
+            sleep: crypto.randomUUID(),
+        };
+    return (0, pages_1.renderAiPage)({
+        actor,
+        playerId,
+        world,
+        stamina: playerRow.stamina,
+        maxStamina: playerRow.max_stamina,
+        location: playerRow.location,
+        gold,
+        baits,
+        recent,
+        requestIds,
+        shopInfo,
+        resultHtml: result ? (0, pages_1.renderResult)(result) : null,
+        readOnly,
+    });
+}
+async function renderLedgerPageForActor(env, actor, playerId) {
+    const walletRow = await Q.toPrepared(env.DB, Q.selectWallet(playerId))
+        .first();
+    if (!walletRow)
+        return text(`wallet missing: ${playerId}`, 500);
+    const txRows = await Q.toPrepared(env.DB, Q.selectRecentWalletTransactions(playerId, 50)).all();
+    const transactions = (txRows.results ?? []).map((r) => ({
+        delta: r.delta,
+        balanceAfter: r.balance_after,
+        reason: r.reason,
+        note: r.note,
+        gameYear: r.game_year,
+        season: r.season,
+        gameDay: r.game_day,
+        gameTime: r.game_time,
+    }));
+    return (0, pages_1.renderLedgerPage)({
+        actor,
+        playerId,
+        gold: walletRow.gold,
+        transactions,
+    });
+}
+async function renderWatchPageForPlayer(env, playerId, autoRefresh) {
+    const worldRow = await Q.toPrepared(env.DB, Q.selectWorldState())
+        .first();
+    if (!worldRow)
+        return text("world state missing", 500);
+    const world = Q.rowToWorldState(worldRow);
+    const playerRow = await Q.toPrepared(env.DB, Q.selectPlayerState(playerId))
+        .first();
+    if (!playerRow)
+        return text(`player state missing: ${playerId}`, 500);
+    const walletRow = await Q.toPrepared(env.DB, Q.selectWallet(playerId))
+        .first();
+    if (!walletRow)
+        return text(`wallet missing: ${playerId}`, 500);
+    const BAIT_NAME = { worm: "蚯蚓", dough: "面团" };
+    const baitRows = await Q.toPrepared(env.DB, Q.selectBaitStacks(playerId))
+        .all();
+    const baitMap = new Map();
+    for (const r of baitRows.results ?? [])
+        baitMap.set(r.item_id, r.quantity);
+    const baits = ["worm", "dough"].map((id) => ({
+        itemId: id,
+        name: BAIT_NAME[id],
+        quantity: baitMap.get(id) ?? 0,
+    }));
+    const fishSumRow = await Q.toPrepared(env.DB, Q.selectInventoryFishSummary(playerId)).first();
+    const fishSummary = {
+        total: fishSumRow?.total ?? 0,
+        locked: fishSumRow?.locked ?? 0,
+        sellable: fishSumRow?.sellable ?? 0,
+        sellablePrice: fishSumRow?.sellable_price ?? 0,
+    };
+    const fishRows = await Q.toPrepared(env.DB, Q.selectCurrentInventoryFish(playerId, 20)).all();
+    const currentFish = (fishRows.results ?? []).map((r) => ({
+        speciesName: r.species_name,
+        weightG: r.weight_g,
+        grade: r.grade,
+        price: r.price,
+        isLocked: r.is_locked === 1,
+        lockReason: r.lock_reason,
+        actorId: r.actor_id,
+        gameYear: r.game_year,
+        season: r.season,
+        gameDay: r.game_day,
+        gameTime: r.game_time,
+    }));
+    const logRows = await Q.toPrepared(env.DB, Q.selectRecentActionLogs(playerId, 30)).all();
+    const logs = (logRows.results ?? []).map((r) => ({
+        actorId: r.actor_id,
+        action: r.action,
+        location: r.location,
+        summary: r.summary,
+        gameYear: r.game_year,
+        season: r.season,
+        gameDay: r.game_day,
+        gameTime: r.game_time,
+    }));
+    const lastActor = logs[0]?.actorId ?? null;
+    const txRows = await Q.toPrepared(env.DB, Q.selectRecentWalletTransactions(playerId, 10)).all();
+    const recentTx = (txRows.results ?? []).map((r) => ({
+        actorId: r.actor_id,
+        delta: r.delta,
+        balanceAfter: r.balance_after,
+        reason: r.reason,
+        note: r.note,
+        gameYear: r.game_year,
+        season: r.season,
+        gameDay: r.game_day,
+        gameTime: r.game_time,
+    }));
+    const codexRow = await Q.toPrepared(env.DB, Q.selectCodexCount(playerId))
+        .first();
+    const totalSpeciesRow = await Q.toPrepared(env.DB, Q.selectTotalSpeciesCount())
+        .first();
+    const achCountRow = await Q.toPrepared(env.DB, Q.selectAchievementCount(playerId))
+        .first();
+    const totalAchRow = await Q.toPrepared(env.DB, Q.selectTotalAchievementCount())
+        .first();
+    const achRows = await Q.toPrepared(env.DB, Q.selectRecentUnlockedAchievements(playerId, 5)).all();
+    const recentAchievements = (achRows.results ?? []).map((r) => {
+        const gd = (0, pages_watch_1.gameDateFromWdi)(r.world_day_index);
+        return {
+            id: r.achievement_id,
+            name: r.name,
+            description: r.description,
+            gameYear: gd.year,
+            season: gd.season,
+            gameDay: gd.gameDay,
+            gameTime: r.game_time,
+        };
+    });
+    const data = {
+        autoRefresh,
+        world,
+        location: playerRow.location,
+        stamina: playerRow.stamina,
+        maxStamina: playerRow.max_stamina,
+        gold: walletRow.gold,
+        baits,
+        fishSummary,
+        currentFish,
+        logs,
+        lastActor,
+        recentTx,
+        codexCount: codexRow?.n ?? 0,
+        totalSpecies: totalSpeciesRow?.n ?? 0,
+        achievementCount: achCountRow?.n ?? 0,
+        totalAchievements: totalAchRow?.n ?? 0,
+        recentAchievements,
+    };
+    return (0, pages_watch_1.renderWatchPage)(data);
+}
+exports.default = {
+    async fetch(req, env) {
+        const url = new URL(req.url);
+        const path = url.pathname;
+        const method = req.method;
+        if (path === "/healthz")
+            return text("ok");
+        if (path === "/healthz/db") {
+            try {
+                const fish = await env.DB.prepare("SELECT COUNT(*) AS n FROM fish_species").first();
+                const world = await env.DB.prepare("SELECT world_day_index, season, game_day, year, " +
+                    "game_minute_of_day, weather, revision " +
+                    "FROM world_state WHERE id = 1").first();
+                if (!world) {
+                    return text(`db ok · fish=${fish?.n ?? "?"} · world_state MISSING`, 500);
+                }
+                return text(`ok · fish_species=${fish?.n ?? "?"} · ` +
+                    `world Y${world.year} ${world.season} D${world.game_day} ` +
+                    `@${world.game_minute_of_day}min ${world.weather} ` +
+                    `(wdi=${world.world_day_index}, rev=${world.revision})`);
+            }
+            catch (err) {
+                return text(`db error: ${err.message}`, 500);
+            }
+        }
+        const enterMatch = path.match(/^\/enter\/([^/]+)\/?$/);
+        if (enterMatch) {
+            if (method !== "GET")
+                return text("method not allowed", 405);
+            const actorRaw = enterMatch[1];
+            if (!(0, identity_1.isActor)(actorRaw))
+                return text(`unknown actor: ${actorRaw}`, 404);
+            const token = url.searchParams.get("token");
+            if (!(0, auth_1.checkToken)(token, env))
+                return text("invalid token", 403);
+            const secure = url.protocol === "https:";
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    location: `/ai/${actorRaw}`,
+                    "set-cookie": (0, auth_1.sessionCookieHeader)(token, secure),
+                    "cache-control": "no-store",
+                },
+            });
+        }
+        if (path === "/" || path === "") {
+            return (0, pages_1.htmlPage)("家机小世界", `<h1>🏡 家机小世界</h1>
+         <p>Phase 1 · Batch 3C</p>
+         <p>家机玩家入口：<a href="/ai/work_gpt">Work GPT</a> · <a href="/ai/chat_gpt">Chat GPT</a></p>
+         <p>观察入口：<a href="/watch">👀 家机观察室</a></p>
+         <p class="muted">或通过 <code>/enter/&lt;actor&gt;?token=...</code> 建立 session。</p>`);
+        }
+        if (path === "/watch" || path === "/watch/") {
+            if (!(0, auth_1.isAuthorized)(req, env))
+                return text("unauthorized", 401);
+            if (method !== "GET")
+                return text("method not allowed", 405);
+            const autoRefresh = url.searchParams.get("auto") !== "0";
+            return renderWatchPageForPlayer(env, "home_gpt", autoRefresh);
+        }
+        if (path.startsWith("/ai/")) {
+            if (!(0, auth_1.isAuthorized)(req, env))
+                return text("unauthorized", 401);
+            const m = path.match(/^\/ai\/([^/]+)(\/act)?\/?$/);
+            if (!m)
+                return text("not found", 404);
+            const actorRaw = m[1];
+            if (!(0, identity_1.isActor)(actorRaw))
+                return text(`unknown actor: ${actorRaw}`, 404);
+            const playerId = (0, identity_1.resolvePlayer)(actorRaw);
+            const isAct = Boolean(m[2]);
+            if (isAct) {
+                if (method !== "POST")
+                    return text("method not allowed", 405);
+                if (playerId === "mouse")
+                    return text("forbidden: mouse is read-only", 403);
+                return handleAct(req, env, actorRaw, playerId);
+            }
+            if (method !== "GET")
+                return text("method not allowed", 405);
+            return renderAiPageForActor(env, actorRaw, playerId, null);
+        }
+        const ledgerMatch = path.match(/^\/ledger\/([^/]+)\/?$/);
+        if (ledgerMatch) {
+            if (!(0, auth_1.isAuthorized)(req, env))
+                return text("unauthorized", 401);
+            if (method !== "GET")
+                return text("method not allowed", 405);
+            const actorRaw = ledgerMatch[1];
+            if (!(0, identity_1.isActor)(actorRaw))
+                return text(`unknown actor: ${actorRaw}`, 404);
+            const playerId = (0, identity_1.resolvePlayer)(actorRaw);
+            return renderLedgerPageForActor(env, actorRaw, playerId);
+        }
+        return text("not found", 404);
+    },
+};
+async function handleAct(req, env, actor, playerId) {
+    let form;
+    try {
+        form = await req.formData();
+    }
+    catch {
+        return text("invalid form data", 400);
+    }
+    const getStr = (k) => {
+        const v = form.get(k);
+        return typeof v === "string" ? v : "";
+    };
+    const action = getStr("action");
+    const requestId = getStr("request_id");
+    if (!action)
+        return text("missing action", 400);
+    if (!requestId)
+        return text("missing request_id", 400);
+    if (!isRequestId(requestId))
+        return text("invalid request_id", 400);
+    const params = {};
+    for (const [k, v] of form.entries()) {
+        if (typeof v === "string")
+            params[k] = v;
+    }
+    let result;
+    try {
+        result = await (0, actions_1.runAction)(env, {
+            actor,
+            playerId,
+            action,
+            form: params,
+            requestId,
+            rng: (0, rng_1.cryptoRng)(),
+        });
+    }
+    catch (err) {
+        return text(`action failed: ${err.message}`, 500);
+    }
+    return renderAiPageForActor(env, actor, playerId, result);
+}
+
+},
+"./pages": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.WEATHER_CN = exports.SEASON_CN = void 0;
+exports.esc = esc;
+exports.htmlPage = htmlPage;
+exports.formatTime = formatTime;
+exports.formatWeight = formatWeight;
+exports.locCn = locCn;
+exports.renderResult = renderResult;
+exports.renderAiPage = renderAiPage;
+exports.renderLedgerPage = renderLedgerPage;
+const CSS = `
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 640px; margin: 0 auto; padding: 16px; line-height: 1.5;
+    color: #222; background: #fafaf6;
+  }
+  h1 { font-size: 20px; margin: 8px 0 16px; }
+  h2 { font-size: 16px; margin: 0 0 8px; color: #555; }
+  .state, .actions, .recent, .result, .shop-info, .ledger,
+  .watch-world, .watch-fish-summary, .watch-current-fish,
+  .watch-actions, .watch-economy, .watch-progress {
+    background: #fff; padding: 12px 16px; border-radius: 8px;
+    margin-bottom: 12px; border: 1px solid #eee;
+  }
+  .result { border-color: #c9e0c9; background: #f4faf4; font-weight: 600; }
+  .result.error { border-color: #e0c9c9; background: #faf4f4; color: #8b3a3a; }
+  .row { display: flex; justify-content: space-between; padding: 2px 0; gap: 12px; }
+  .muted { color: #888; font-size: 13px; }
+  form { display: inline-block; margin: 4px 6px 4px 0; }
+  button {
+    min-height: 44px; min-width: 44px; padding: 10px 18px;
+    font-size: 16px; border-radius: 6px; border: 1px solid #888;
+    background: #fff; cursor: pointer; font-family: inherit;
+  }
+  button:hover { background: #f0f0f0; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .recent ul, .ledger ul { list-style: none; padding: 0; margin: 0; }
+  .recent li, .ledger li { padding: 3px 0; font-size: 14px; }
+  .ledger .tx { display: flex; justify-content: space-between; gap: 12px; }
+  .ledger .pos { color: #2a7a2a; }
+  .ledger .neg { color: #8b3a3a; }
+  .tx-pos { color: #2a7a2a; }
+  .tx-neg { color: #8b3a3a; }
+  .feed-item { padding: 6px 0; border-bottom: 1px dashed #eee; }
+  .feed-item:last-child { border-bottom: none; }
+  .feed-meta { font-size: 12px; color: #888; }
+  .feed-summary { font-size: 14px; }
+  .feed-item.rejected .feed-summary { color: #8b3a3a; }
+  .tx-item { padding: 5px 0; border-bottom: 1px dashed #eee; }
+  .tx-item:last-child { border-bottom: none; }
+  .watch-fish-summary .row, .watch-progress .row { padding: 3px 0; }
+  .watch-current-fish ul, .watch-progress ul { list-style: none; padding: 0; margin: 0; }
+  .watch-current-fish li { padding: 6px 0; border-bottom: 1px dashed #eee; }
+  .watch-current-fish li:last-child { border-bottom: none; }
+  a { color: #2a5a9a; }
+`;
+function esc(s) {
+    return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+function htmlPage(title, body, status = 200, extraHead = "") {
+    const doc = `<!doctype html><html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${extraHead}
+<title>${esc(title)}</title>
+<style>${CSS}</style>
+</head><body>${body}</body></html>`;
+    return new Response(doc, {
+        status,
+        headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+        },
+    });
+}
+function formatTime(minuteOfDay) {
+    const m = ((minuteOfDay % 1440) + 1440) % 1440;
+    const h = Math.floor(m / 60).toString().padStart(2, "0");
+    const mm = (m % 60).toString().padStart(2, "0");
+    return `${h}:${mm}`;
+}
+function formatWeight(weightG) {
+    if (weightG < 1000)
+        return `${weightG}g`;
+    return `${(weightG / 1000).toFixed(2)}kg`;
+}
+exports.SEASON_CN = {
+    spring: "春", summer: "夏", autumn: "秋", winter: "冬",
+};
+exports.WEATHER_CN = {
+    sunny: "晴", cloudy: "阴", light_rain: "小雨", rain: "大雨",
+    thunder: "雷雨", snow: "雪", fog: "雾",
+};
+function locCn(loc) {
+    if (loc === "home")
+        return "小屋";
+    if (loc === "river")
+        return "河边";
+    if (loc === "shop")
+        return "商店";
+    return loc;
+}
+function renderResult(a) {
+    const cls = a.ok ? "result" : "result error";
+    const extras = [];
+    if (a.ok && a.action === "cast_rod" && a.code === "catch") {
+        const f = a.fish;
+        const tags = [];
+        if (f.isNewSpecies)
+            tags.push("🆕 新入图鉴");
+        if (f.isNewRecord)
+            tags.push("🏆 新纪录");
+        if (f.isLocked)
+            tags.push("🔒 已保护");
+        extras.push(`<div class="muted">${esc(f.name)} ${formatWeight(f.weightG)} · ${esc(f.grade)} · 估值 ${f.price}G${tags.length ? " · " + tags.join(" · ") : ""}</div>`);
+    }
+    else if (a.ok && (a.action === "buy_bait" || a.action === "sell_all_fish")) {
+        extras.push(`<div class="muted">余额 ${a.goldAfter}G</div>`);
+    }
+    else if (a.ok && (a.action === "rest" || a.action === "sleep")) {
+        extras.push(`<div class="muted">体力 ${a.staminaBefore} → ${a.staminaAfter}</div>`);
+    }
+    return `<div class="${cls}">
+  <div>${esc(a.summary)}</div>
+  ${extras.join("")}
+</div>`;
+}
+function renderAiPage(d) {
+    const w = d.world;
+    const seasonCn = exports.SEASON_CN[w.season] ?? w.season;
+    const weatherCn = exports.WEATHER_CN[w.weather] ?? w.weather;
+    const timeStr = formatTime(w.gameMinuteOfDay);
+    const actorParam = encodeURIComponent(d.actor);
+    const baitList = d.baits
+        .filter((b) => b.quantity > 0)
+        .map((b) => `${esc(b.name)}×${b.quantity}`)
+        .join("，") || "（无）";
+    const recentHtml = d.recent.length
+        ? `<ul>${d.recent
+            .map((r) => `<li class="muted">D${r.gameDay} ${formatTime(r.gameTime)} · ${esc(r.name)} ${formatWeight(r.weightG)} (${esc(r.grade)}，估值 ${r.price}G)</li>`)
+            .join("")}</ul>`
+        : `<p class="muted">还没有钓到过鱼。</p>`;
+    const actionForms = [];
+    if (!d.readOnly) {
+        if (d.location === "home") {
+            if (d.requestIds.moveRiver) {
+                actionForms.push(formHtml(actorParam, "move", { to: "river" }, d.requestIds.moveRiver, "去河边"));
+            }
+            if (d.requestIds.moveShop) {
+                actionForms.push(formHtml(actorParam, "move", { to: "shop" }, d.requestIds.moveShop, "去商店"));
+            }
+            if (d.requestIds.rest) {
+                actionForms.push(formHtml(actorParam, "rest", {}, d.requestIds.rest, "休息一小时（+20体力）", d.stamina >= d.maxStamina));
+            }
+            if (d.requestIds.sleep) {
+                actionForms.push(formHtml(actorParam, "sleep", {}, d.requestIds.sleep, "睡到下一个清晨"));
+            }
+        }
+        else if (d.location === "river") {
+            const worm = d.baits.find((b) => b.itemId === "worm")?.quantity ?? 0;
+            const dough = d.baits.find((b) => b.itemId === "dough")?.quantity ?? 0;
+            if (d.requestIds.castWorm) {
+                actionForms.push(formHtml(actorParam, "cast_rod", { bait_id: "worm" }, d.requestIds.castWorm, `用蚯蚓抛竿（×${worm}）`, worm < 1));
+            }
+            if (d.requestIds.castDough) {
+                actionForms.push(formHtml(actorParam, "cast_rod", { bait_id: "dough" }, d.requestIds.castDough, `用面团抛竿（×${dough}）`, dough < 1));
+            }
+            if (d.requestIds.moveShop) {
+                actionForms.push(formHtml(actorParam, "move", { to: "shop" }, d.requestIds.moveShop, "去商店"));
+            }
+            if (d.requestIds.moveHome) {
+                actionForms.push(formHtml(actorParam, "move", { to: "home" }, d.requestIds.moveHome, "回家"));
+            }
+        }
+        else if (d.location === "shop") {
+            if (d.requestIds.buyWorm) {
+                actionForms.push(formHtml(actorParam, "buy_bait", { item_id: "worm", quantity: "10" }, d.requestIds.buyWorm, "买蚯蚓×10 · 30G", d.gold < 30));
+            }
+            if (d.requestIds.buyDough) {
+                actionForms.push(formHtml(actorParam, "buy_bait", { item_id: "dough", quantity: "10" }, d.requestIds.buyDough, "买面团×10 · 50G", d.gold < 50));
+            }
+            if (d.requestIds.sellAll) {
+                actionForms.push(formHtml(actorParam, "sell_all_fish", {}, d.requestIds.sellAll, "卖出所有可出售的鱼", (d.shopInfo?.sellableCount ?? 0) === 0));
+            }
+            if (d.requestIds.moveHome) {
+                actionForms.push(formHtml(actorParam, "move", { to: "home" }, d.requestIds.moveHome, "回家"));
+            }
+            if (d.requestIds.moveRiver) {
+                actionForms.push(formHtml(actorParam, "move", { to: "river" }, d.requestIds.moveRiver, "去河边"));
+            }
+        }
+    }
+    const shopInfoHtml = d.location === "shop" && d.shopInfo
+        ? `<div class="shop-info">
+  <h2>商店</h2>
+  <div class="row"><span>可出售鱼</span><span>${d.shopInfo.sellableCount} 条</span></div>
+  <div class="row"><span>预计收入</span><span>${d.shopInfo.sellablePrice} G</span></div>
+  <div class="row"><span>已保护鱼</span><span>${d.shopInfo.lockedCount} 条</span></div>
+</div>`
+        : "";
+    const body = `
+<h1>🏡 家机小世界 · ${esc(d.actor)}</h1>
+
+<div class="state">
+  <div class="row"><span>第${w.year}年 · ${seasonCn} · 第${w.gameDay}日 · ${timeStr}</span><span>${weatherCn}</span></div>
+  <div class="row"><span>体力 ${d.stamina}/${d.maxStamina}</span><span>金币 ${d.gold}G</span></div>
+  <div class="row"><span>地点：${esc(locCn(d.location))}</span><span>鱼饵：${baitList}</span></div>
+</div>
+
+${d.resultHtml ?? ""}
+${shopInfoHtml}
+
+<div class="actions">
+  <h2>行动</h2>
+  ${d.readOnly ? `<p class="muted">访客模式暂时只读。</p>` : actionForms.join("\n") || `<p class="muted">这里没有可做的动作。</p>`}
+</div>
+
+<div class="recent">
+  <h2>最近钓获</h2>
+  ${recentHtml}
+</div>
+
+<p><a href="/ledger/${actorParam}">[查看账本]</a> · <a href="/watch">[👀 查看家机观察室]</a></p>
+`;
+    return htmlPage(`家机小世界 · ${d.actor}`, body);
+}
+function formHtml(actorParam, action, params, requestId, label, disabled = false) {
+    const hidden = Object.entries(params)
+        .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
+        .join("");
+    return `<form method="POST" action="/ai/${actorParam}/act">
+  <input type="hidden" name="action" value="${esc(action)}">
+  <input type="hidden" name="request_id" value="${esc(requestId)}">
+  ${hidden}
+  <button type="submit"${disabled ? " disabled" : ""}>${esc(label)}</button>
+</form>`;
+}
+const REASON_CN = {
+    buy_bait: "购买鱼饵",
+    sell_fish: "卖鱼",
+};
+function reasonCn(reason) {
+    return REASON_CN[reason] ?? reason;
+}
+function renderLedgerPage(d) {
+    const actorParam = encodeURIComponent(d.actor);
+    const txHtml = d.transactions.length
+        ? `<ul>${d.transactions
+            .map((tx) => {
+            const seasonCn = exports.SEASON_CN[tx.season] ?? tx.season;
+            const sign = tx.delta >= 0 ? "+" : "−";
+            const cls = tx.delta >= 0 ? "pos" : "neg";
+            const note = tx.note ? ` · ${esc(tx.note)}` : "";
+            return `<li class="tx">
+  <span class="muted">Y${tx.gameYear} ${seasonCn}D${tx.gameDay} ${formatTime(tx.gameTime)} · ${esc(reasonCn(tx.reason))}${note}</span>
+  <span class="${cls}">${sign}${Math.abs(tx.delta)}G <span class="muted">· ${tx.balanceAfter}G</span></span>
+</li>`;
+        })
+            .join("")}</ul>`
+        : `<p class="muted">还没有任何交易记录。</p>`;
+    const body = `
+<h1>📒 账本 · ${esc(d.actor)}</h1>
+<div class="state">
+  <div class="row"><span>当前余额</span><span><strong>${d.gold} G</strong></span></div>
+</div>
+<div class="ledger">
+  <h2>最近流水</h2>
+  ${txHtml}
+</div>
+<p><a href="/ai/${actorParam}">[返回家机]</a></p>
+`;
+    return htmlPage(`账本 · ${d.actor}`, body);
+}
+
+},
+"./pages_watch": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.gameDateFromWdi = gameDateFromWdi;
+exports.renderWatchPage = renderWatchPage;
+const world_1 = require("./world");
+const pages_1 = require("./pages");
+function actorCn(id) {
+    if (!id)
+        return "—";
+    if (id === "work_gpt")
+        return "Work GPT";
+    if (id === "chat_gpt")
+        return "Chat GPT";
+    if (id === "mouse")
+        return "鼠";
+    return id;
+}
+const LOCK_REASON_CN = {
+    first_catch: "首次发现",
+    record: "纪录鱼",
+    ss: "SS珍稀个体",
+    trophy: "Trophy收藏",
+    manual: "手动收藏",
+};
+function lockReasonCn(r) {
+    if (!r)
+        return "";
+    return LOCK_REASON_CN[r] ?? r;
+}
+const TX_REASON_CN = {
+    buy_bait: "购买鱼饵",
+    sell_fish: "卖鱼",
+};
+function txReasonCn(r) {
+    return TX_REASON_CN[r] ?? r;
+}
+function gameDateCn(gameYear, season, gameDay, gameTime) {
+    const s = pages_1.SEASON_CN[season] ?? season;
+    return `Y${gameYear} · ${s}D${gameDay} ${(0, pages_1.formatTime)(gameTime)}`;
+}
+/**
+ * world_day_index 反算游戏日期。
+ * 与 db.ts worldDayIndex() 严格互逆：
+ *   wdi = (year-1)*112 + seasonIdx*28 + gameDay
+ */
+function gameDateFromWdi(wdi) {
+    if (!Number.isInteger(wdi) || wdi < 1) {
+        throw new Error("gameDateFromWdi: wdi must be an integer >= 1");
+    }
+    const daysPerYear = world_1.SEASONS_PER_YEAR * world_1.DAYS_PER_SEASON;
+    const zero = wdi - 1;
+    const year = Math.floor(zero / daysPerYear) + 1;
+    const withinYear = zero % daysPerYear;
+    const seasonIdx = Math.floor(withinYear / world_1.DAYS_PER_SEASON);
+    const gameDay = (withinYear % world_1.DAYS_PER_SEASON) + 1;
+    return {
+        year,
+        season: world_1.SEASON_ORDER[seasonIdx],
+        gameDay,
+    };
+}
+function renderWatchPage(d) {
+    const w = d.world;
+    const seasonCn = pages_1.SEASON_CN[w.season] ?? w.season;
+    const weatherCn = pages_1.WEATHER_CN[w.weather] ?? w.weather;
+    const timeStr = (0, pages_1.formatTime)(w.gameMinuteOfDay);
+    const baitList = d.baits
+        .filter((b) => b.quantity > 0)
+        .map((b) => `${(0, pages_1.esc)(b.name)}×${b.quantity}`)
+        .join("，") || "（无）";
+    const refreshControls = d.autoRefresh
+        ? `<p class="muted">每 20 秒自动刷新 · <a href="/watch?auto=0">[关闭自动刷新]</a> · <a href="/watch">[立即刷新]</a></p>`
+        : `<p class="muted">自动刷新已关闭 · <a href="/watch">[开启20秒自动刷新]</a> · <a href="/watch?auto=0">[立即刷新]</a></p>`;
+    const currentFishHtml = d.currentFish.length
+        ? `<ul>${d.currentFish
+            .map((f) => {
+            const lock = f.isLocked
+                ? `🔒 ${(0, pages_1.esc)(lockReasonCn(f.lockReason))}`
+                : "可出售";
+            return `<li>
+  <strong>${(0, pages_1.esc)(f.speciesName)}</strong> · ${(0, pages_1.formatWeight)(f.weightG)} · ${(0, pages_1.esc)(f.grade)} · 估值 ${f.price}G
+  <br><span class="muted">${lock} · ${(0, pages_1.esc)(actorCn(f.actorId))} · ${gameDateCn(f.gameYear, f.season, f.gameDay, f.gameTime)}</span>
+</li>`;
+        })
+            .join("")}</ul>`
+        : `<p class="muted">鱼篓是空的。</p>`;
+    const logsHtml = d.logs.length
+        ? d.logs
+            .map((l) => {
+            const rejected = l.summary.startsWith("[拒绝]");
+            return `<div class="feed-item${rejected ? " rejected" : ""}">
+  <div class="feed-meta">${gameDateCn(l.gameYear, l.season, l.gameDay, l.gameTime)} · ${(0, pages_1.esc)(actorCn(l.actorId))}${l.location ? " · " + (0, pages_1.esc)((0, pages_1.locCn)(l.location)) : ""}</div>
+  <div class="feed-summary">${(0, pages_1.esc)(l.summary)}</div>
+</div>`;
+        })
+            .join("")
+        : `<p class="muted">还没有行动记录。</p>`;
+    const txHtml = d.recentTx.length
+        ? d.recentTx
+            .map((tx) => {
+            const sign = tx.delta >= 0 ? "+" : "−";
+            const cls = tx.delta >= 0 ? "tx-pos" : "tx-neg";
+            const abs = Math.abs(tx.delta);
+            const note = tx.note ? ` · ${(0, pages_1.esc)(tx.note)}` : "";
+            return `<div class="tx-item">
+  <div class="feed-meta">${gameDateCn(tx.gameYear, tx.season, tx.gameDay, tx.gameTime)} · ${(0, pages_1.esc)(actorCn(tx.actorId))}</div>
+  <div><span class="${cls}">${sign}${abs}G</span> · ${(0, pages_1.esc)(txReasonCn(tx.reason))}${note} <span class="muted">· 余额 ${tx.balanceAfter}G</span></div>
+</div>`;
+        })
+            .join("")
+        : `<p class="muted">还没有交易记录。</p>`;
+    const achHtml = d.recentAchievements.length
+        ? `<ul>${d.recentAchievements
+            .map((a) => `<li>《${(0, pages_1.esc)(a.name)}》 <span class="muted">· ${gameDateCn(a.gameYear, a.season, a.gameDay, a.gameTime)}</span><br><span class="muted">${(0, pages_1.esc)(a.description)}</span></li>`)
+            .join("")}</ul>`
+        : `<p class="muted">还没有解锁任何成就。</p>`;
+    const body = `
+<h1>👀 家机小世界 · 观察室</h1>
+
+${refreshControls}
+
+<div class="watch-world">
+  <div class="row"><span>Y${w.year} · ${seasonCn} · 第${w.gameDay}日 · ${timeStr}</span><span>${weatherCn}</span></div>
+  <div class="row"><span>地点：${(0, pages_1.esc)((0, pages_1.locCn)(d.location))}</span><span>体力：${d.stamina}/${d.maxStamina}</span></div>
+  <div class="row"><span>金币：${d.gold}G</span><span>鱼饵：${baitList}</span></div>
+</div>
+
+<div class="watch-fish-summary">
+  <div class="row"><span>当前鱼篓</span><span>${d.fishSummary.total} 条</span></div>
+  <div class="row"><span>保护收藏</span><span>${d.fishSummary.locked} 条</span></div>
+  <div class="row"><span>可出售</span><span>${d.fishSummary.sellable} 条</span></div>
+  <div class="row"><span>可出售总估值</span><span>${d.fishSummary.sellablePrice}G</span></div>
+</div>
+
+<p class="muted">最近操作者：<strong>${(0, pages_1.esc)(actorCn(d.lastActor))}</strong></p>
+
+<div class="watch-current-fish">
+  <h2>当前鱼篓</h2>
+  ${currentFishHtml}
+</div>
+
+<div class="watch-actions">
+  <h2>行动记录</h2>
+  ${logsHtml}
+</div>
+
+<div class="watch-economy">
+  <h2>经济动态</h2>
+  <p>当前余额：<strong>${d.gold}G</strong></p>
+  ${txHtml}
+</div>
+
+<div class="watch-progress">
+  <h2>图鉴与成就</h2>
+  <div class="row"><span>鱼类图鉴</span><span>${d.codexCount} / ${d.totalSpecies}</span></div>
+  <div class="row"><span>成就</span><span>${d.achievementCount} / ${d.totalAchievements}</span></div>
+  <h2 style="margin-top:12px;">最近解锁</h2>
+  ${achHtml}
+</div>
+
+<p>
+  <a href="/ai/work_gpt">[Work GPT 界面]</a>
+  ·
+  <a href="/ai/chat_gpt">[Chat GPT 界面]</a>
+  ·
+  <a href="/watch">[立即刷新]</a>
+</p>
+`;
+    const extraHead = d.autoRefresh
+        ? `<meta http-equiv="refresh" content="20">`
+        : "";
+    return (0, pages_1.htmlPage)("家机小世界 · 观察室", body, 200, extraHead);
+}
+
+},
+"./players": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.toPrepared = toPrepared;
+exports.selectWorldState = selectWorldState;
+exports.rowToWorldState = rowToWorldState;
+exports.rowToWorldStateSnapshot = rowToWorldStateSnapshot;
+exports.selectPlayerState = selectPlayerState;
+exports.selectWallet = selectWallet;
+exports.selectInventoryStack = selectInventoryStack;
+exports.selectInventoryStacks = selectInventoryStacks;
+exports.selectBaitStacks = selectBaitStacks;
+exports.selectInventoryFish = selectInventoryFish;
+exports.selectSellableFish = selectSellableFish;
+exports.selectItemDefinition = selectItemDefinition;
+exports.selectSellableFishSummary = selectSellableFishSummary;
+exports.selectLockedFishCount = selectLockedFishCount;
+exports.selectRecentWalletTransactions = selectRecentWalletTransactions;
+exports.selectAllFishSpecies = selectAllFishSpecies;
+exports.rowToFishSpecies = rowToFishSpecies;
+exports.selectAllBaitModifiers = selectAllBaitModifiers;
+exports.rowToBaitModifier = rowToBaitModifier;
+exports.selectCodexEntry = selectCodexEntry;
+exports.selectRecentCatches = selectRecentCatches;
+exports.selectAchievementIds = selectAchievementIds;
+exports.selectRecentActionLogs = selectRecentActionLogs;
+exports.selectCurrentInventoryFish = selectCurrentInventoryFish;
+exports.selectInventoryFishSummary = selectInventoryFishSummary;
+exports.selectCodexCount = selectCodexCount;
+exports.selectFishingGradeHistory = selectFishingGradeHistory;
+exports.selectTotalSpeciesCount = selectTotalSpeciesCount;
+exports.selectAchievementCount = selectAchievementCount;
+exports.selectTotalAchievementCount = selectTotalAchievementCount;
+exports.selectRecentUnlockedAchievements = selectRecentUnlockedAchievements;
+exports.selectActionRequest = selectActionRequest;
+exports.deductStamina = deductStamina;
+exports.restoreStamina = restoreStamina;
+exports.setStaminaFull = setStaminaFull;
+exports.setLocation = setLocation;
+exports.deductGold = deductGold;
+exports.addGold = addGold;
+exports.ensureInventoryStack = ensureInventoryStack;
+exports.deductItem = deductItem;
+exports.addItem = addItem;
+exports.updateWorldState = updateWorldState;
+exports.insertFishCatch = insertFishCatch;
+exports.upsertCodex = upsertCodex;
+exports.insertActionLog = insertActionLog;
+exports.insertWalletTransaction = insertWalletTransaction;
+exports.insertActionRequest = insertActionRequest;
+exports.insertPlayerAchievement = insertPlayerAchievement;
+exports.sellAllSellableFish = sellAllSellableFish;
+exports.markFishSold = markFishSold;
+function toPrepared(db, stmt) {
+    return db.prepare(stmt.sql).bind(...stmt.params);
+}
+function assertPositiveInteger(value, label) {
+    if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(`${label} must be a positive integer`);
+    }
+}
+function selectWorldState() {
+    return {
+        sql: `SELECT world_day_index, game_day, season, year,
+                 game_minute_of_day, weather, weather_locked_for_world_day,
+                 revision
+          FROM world_state WHERE id = 1`,
+        params: [],
+    };
+}
+function rowToWorldState(row) {
+    return {
+        worldDayIndex: row.world_day_index,
+        gameDay: row.game_day,
+        season: row.season,
+        year: row.year,
+        gameMinuteOfDay: row.game_minute_of_day,
+        weather: row.weather,
+        weatherLockedForWorldDay: row.weather_locked_for_world_day,
+    };
+}
+function rowToWorldStateSnapshot(row) {
+    return {
+        state: rowToWorldState(row),
+        revision: row.revision,
+    };
+}
+function selectPlayerState(playerId) {
+    return {
+        sql: `SELECT player_id, stamina, max_stamina, location, updated_at
+          FROM player_state WHERE player_id = ?`,
+        params: [playerId],
+    };
+}
+function selectWallet(playerId) {
+    return {
+        sql: `SELECT player_id, gold, updated_at FROM wallets WHERE player_id = ?`,
+        params: [playerId],
+    };
+}
+function selectInventoryStack(playerId, itemId) {
+    return {
+        sql: `SELECT player_id, item_id, quantity, updated_at
+          FROM inventory_stacks
+          WHERE player_id = ? AND item_id = ?`,
+        params: [playerId, itemId],
+    };
+}
+function selectInventoryStacks(playerId) {
+    return {
+        sql: `SELECT item_id, quantity FROM inventory_stacks
+          WHERE player_id = ? AND quantity > 0
+          ORDER BY item_id`,
+        params: [playerId],
+    };
+}
+function selectBaitStacks(playerId) {
+    return {
+        sql: `SELECT s.item_id, s.quantity
+          FROM inventory_stacks s
+          JOIN item_definitions d ON d.id = s.item_id
+          WHERE s.player_id = ? AND d.type = 'bait' AND s.quantity > 0
+          ORDER BY s.item_id`,
+        params: [playerId],
+    };
+}
+function selectInventoryFish(playerId) {
+    return {
+        sql: `SELECT * FROM fish_catches
+          WHERE player_id = ? AND status = 'inventory'
+          ORDER BY caught_at DESC`,
+        params: [playerId],
+    };
+}
+function selectSellableFish(playerId) {
+    return {
+        sql: `SELECT * FROM fish_catches
+          WHERE player_id = ?
+            AND status = 'inventory'
+            AND is_locked = 0
+          ORDER BY caught_at DESC`,
+        params: [playerId],
+    };
+}
+function selectItemDefinition(itemId) {
+    return {
+        sql: `SELECT id, name, type, buy_price, sell_price, stackable, description
+          FROM item_definitions WHERE id = ?`,
+        params: [itemId],
+    };
+}
+function selectSellableFishSummary(playerId) {
+    return {
+        sql: `SELECT COUNT(*) AS fish_count,
+                 COALESCE(SUM(price), 0) AS total_price
+          FROM fish_catches
+          WHERE player_id = ?
+            AND status = 'inventory'
+            AND is_locked = 0`,
+        params: [playerId],
+    };
+}
+function selectLockedFishCount(playerId) {
+    return {
+        sql: `SELECT COUNT(*) AS n FROM fish_catches
+          WHERE player_id = ?
+            AND status = 'inventory'
+            AND is_locked = 1`,
+        params: [playerId],
+    };
+}
+function selectRecentWalletTransactions(playerId, limit) {
+    assertPositiveInteger(limit, "selectRecentWalletTransactions limit");
+    return {
+        sql: `SELECT id, actor_id, delta, balance_after, reason, note,
+                 game_year, season, game_day, game_time, created_at
+          FROM wallet_transactions
+          WHERE player_id = ?
+          ORDER BY id DESC
+          LIMIT ?`,
+        params: [playerId, limit],
+    };
+}
+function selectAllFishSpecies() {
+    return {
+        sql: `SELECT id, name, rarity, min_weight_g, max_weight_g, weight_skew,
+                 price_per_kg, spawn_weight, seasons, times, weathers,
+                 locations, description
+          FROM fish_species`,
+        params: [],
+    };
+}
+function rowToFishSpecies(row) {
+    return {
+        id: row.id,
+        name: row.name,
+        rarity: row.rarity,
+        minWeightG: row.min_weight_g,
+        maxWeightG: row.max_weight_g,
+        weightSkew: row.weight_skew,
+        pricePerKg: row.price_per_kg,
+        spawnWeight: row.spawn_weight,
+        seasons: JSON.parse(row.seasons),
+        times: JSON.parse(row.times),
+        weathers: JSON.parse(row.weathers),
+        locations: JSON.parse(row.locations),
+    };
+}
+function selectAllBaitModifiers() {
+    return {
+        sql: `SELECT species_id, bait_id, multiplier FROM fish_bait_modifiers`,
+        params: [],
+    };
+}
+function rowToBaitModifier(row) {
+    return {
+        speciesId: row.species_id,
+        baitId: row.bait_id,
+        multiplier: row.multiplier,
+    };
+}
+function selectCodexEntry(playerId, speciesId) {
+    return {
+        sql: `SELECT player_id, species_id, first_caught_at, catch_count,
+                 max_weight_g, max_grade
+          FROM codex_fish WHERE player_id = ? AND species_id = ?`,
+        params: [playerId, speciesId],
+    };
+}
+function selectRecentCatches(playerId, limit) {
+    assertPositiveInteger(limit, "selectRecentCatches limit");
+    return {
+        sql: `SELECT fc.id, fc.species_id, fs.name AS species_name,
+                 fc.weight_g, fc.grade, fc.price, fc.game_day, fc.game_time
+          FROM fish_catches fc
+          JOIN fish_species fs ON fs.id = fc.species_id
+          WHERE fc.player_id = ?
+          ORDER BY fc.caught_at DESC, fc.id DESC
+          LIMIT ?`,
+        params: [playerId, limit],
+    };
+}
+function selectAchievementIds(playerId) {
+    return {
+        sql: `SELECT achievement_id FROM player_achievements WHERE player_id = ?`,
+        params: [playerId],
+    };
+}
+function selectRecentActionLogs(playerId, limit) {
+    assertPositiveInteger(limit, "selectRecentActionLogs limit");
+    return {
+        sql: `SELECT actor_id, action, location, summary,
+                 game_year, season, game_day, game_time, created_at
+          FROM action_logs
+          WHERE player_id = ?
+          ORDER BY id DESC
+          LIMIT ?`,
+        params: [playerId, limit],
+    };
+}
+function selectCurrentInventoryFish(playerId, limit) {
+    assertPositiveInteger(limit, "selectCurrentInventoryFish limit");
+    return {
+        sql: `SELECT fc.id, fc.species_id, fs.name AS species_name,
+                 fc.weight_g, fc.grade, fc.price,
+                 fc.is_locked, fc.lock_reason, fc.actor_id,
+                 fc.game_year, fc.season, fc.game_day, fc.game_time,
+                 fc.caught_at
+          FROM fish_catches fc
+          JOIN fish_species fs ON fs.id = fc.species_id
+          WHERE fc.player_id = ? AND fc.status = 'inventory'
+          ORDER BY fc.caught_at DESC, fc.id DESC
+          LIMIT ?`,
+        params: [playerId, limit],
+    };
+}
+function selectInventoryFishSummary(playerId) {
+    return {
+        sql: `SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN is_locked = 1 THEN 1 ELSE 0 END), 0) AS locked,
+            COALESCE(SUM(CASE WHEN is_locked = 0 THEN 1 ELSE 0 END), 0) AS sellable,
+            COALESCE(SUM(CASE WHEN is_locked = 0 THEN price ELSE 0 END), 0) AS sellable_price
+          FROM fish_catches
+          WHERE player_id = ? AND status = 'inventory'`,
+        params: [playerId],
+    };
+}
+function selectCodexCount(playerId) {
+    return {
+        sql: `SELECT COUNT(*) AS n FROM codex_fish WHERE player_id = ?`,
+        params: [playerId],
+    };
+}
+function selectFishingGradeHistory(playerId) {
+    return {
+        sql: `SELECT
+            EXISTS(SELECT 1 FROM fish_catches
+                   WHERE player_id = ? AND grade = 'SS') AS has_ss,
+            EXISTS(SELECT 1 FROM fish_catches
+                   WHERE player_id = ? AND grade = 'Trophy') AS has_trophy`,
+        params: [playerId, playerId],
+    };
+}
+function selectTotalSpeciesCount() {
+    return { sql: `SELECT COUNT(*) AS n FROM fish_species`, params: [] };
+}
+function selectAchievementCount(playerId) {
+    return {
+        sql: `SELECT COUNT(*) AS n FROM player_achievements WHERE player_id = ?`,
+        params: [playerId],
+    };
+}
+function selectTotalAchievementCount() {
+    return { sql: `SELECT COUNT(*) AS n FROM achievements`, params: [] };
+}
+function selectRecentUnlockedAchievements(playerId, limit) {
+    assertPositiveInteger(limit, "selectRecentUnlockedAchievements limit");
+    return {
+        sql: `SELECT pa.achievement_id, a.name, a.description,
+                 pa.unlocked_at, pa.game_time, pa.world_day_index
+          FROM player_achievements pa
+          JOIN achievements a ON a.id = pa.achievement_id
+          WHERE pa.player_id = ?
+          ORDER BY pa.unlocked_at DESC, pa.achievement_id ASC
+          LIMIT ?`,
+        params: [playerId, limit],
+    };
+}
+function selectActionRequest(requestId) {
+    return {
+        sql: `SELECT request_id, actor_id, player_id, action, result_json,
+                 state_revision_before, created_at
+          FROM action_requests WHERE request_id = ?`,
+        params: [requestId],
+    };
+}
+function deductStamina(playerId, amount, nowMs) {
+    assertPositiveInteger(amount, "deductStamina amount");
+    return {
+        // 前置校验由 Batch 3 做；这里故意不加 stamina >= ?，让并发不足时触发 CHECK 并整批回滚。
+        sql: `UPDATE player_state
+          SET stamina = stamina - ?, updated_at = ?
+          WHERE player_id = ?`,
+        params: [amount, nowMs, playerId],
+    };
+}
+function restoreStamina(playerId, amount, nowMs) {
+    assertPositiveInteger(amount, "restoreStamina amount");
+    return {
+        sql: `UPDATE player_state
+          SET stamina = MIN(stamina + ?, max_stamina), updated_at = ?
+          WHERE player_id = ?`,
+        params: [amount, nowMs, playerId],
+    };
+}
+function setStaminaFull(playerId, nowMs) {
+    return {
+        sql: `UPDATE player_state
+          SET stamina = max_stamina, updated_at = ?
+          WHERE player_id = ?`,
+        params: [nowMs, playerId],
+    };
+}
+function setLocation(playerId, location, nowMs) {
+    if (!location)
+        throw new Error("setLocation: location must not be empty");
+    return {
+        sql: `UPDATE player_state
+          SET location = ?, updated_at = ?
+          WHERE player_id = ?`,
+        params: [location, nowMs, playerId],
+    };
+}
+function deductGold(playerId, amount, nowMs) {
+    assertPositiveInteger(amount, "deductGold amount");
+    return {
+        sql: `UPDATE wallets
+          SET gold = gold - ?, updated_at = ?
+          WHERE player_id = ?`,
+        params: [amount, nowMs, playerId],
+    };
+}
+function addGold(playerId, amount, nowMs) {
+    assertPositiveInteger(amount, "addGold amount");
+    return {
+        sql: `UPDATE wallets
+          SET gold = gold + ?, updated_at = ?
+          WHERE player_id = ?`,
+        params: [amount, nowMs, playerId],
+    };
+}
+function ensureInventoryStack(playerId, itemId, nowMs) {
+    return {
+        sql: `INSERT INTO inventory_stacks (player_id, item_id, quantity, updated_at)
+          VALUES (?, ?, 0, ?)
+          ON CONFLICT(player_id, item_id) DO NOTHING`,
+        params: [playerId, itemId, nowMs],
+    };
+}
+function deductItem(playerId, itemId, quantity, nowMs) {
+    assertPositiveInteger(quantity, "deductItem quantity");
+    return {
+        sql: `UPDATE inventory_stacks
+          SET quantity = quantity - ?, updated_at = ?
+          WHERE player_id = ? AND item_id = ?`,
+        params: [quantity, nowMs, playerId, itemId],
+    };
+}
+function addItem(playerId, itemId, quantity, nowMs) {
+    assertPositiveInteger(quantity, "addItem quantity");
+    return {
+        sql: `INSERT INTO inventory_stacks (player_id, item_id, quantity, updated_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(player_id, item_id) DO UPDATE SET
+            quantity = quantity + excluded.quantity,
+            updated_at = excluded.updated_at`,
+        params: [playerId, itemId, quantity, nowMs],
+    };
+}
+function updateWorldState(state, nowMs) {
+    return {
+        sql: `UPDATE world_state SET
+            world_day_index = ?,
+            game_day = ?,
+            season = ?,
+            year = ?,
+            game_minute_of_day = ?,
+            weather = ?,
+            weather_locked_for_world_day = ?,
+            revision = revision + 1,
+            updated_at = ?
+          WHERE id = 1`,
+        params: [
+            state.worldDayIndex,
+            state.gameDay,
+            state.season,
+            state.year,
+            state.gameMinuteOfDay,
+            state.weather,
+            state.weatherLockedForWorldDay,
+            nowMs,
+        ],
+    };
+}
+function insertFishCatch(row) {
+    return {
+        sql: `INSERT INTO fish_catches (
+            player_id, actor_id, species_id, weight_g, grade, price,
+            is_new_species, is_new_record,
+            status, is_favorite, is_locked, lock_reason, sold_at,
+            location, bait_id,
+            game_year, season, weather, game_day, game_time, world_day_index,
+            request_id, caught_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        params: [
+            row.playerId, row.actorId, row.speciesId, row.weightG, row.grade, row.price,
+            row.isNewSpecies ? 1 : 0, row.isNewRecord ? 1 : 0,
+            row.status, row.isFavorite ? 1 : 0, row.isLocked ? 1 : 0,
+            row.lockReason, row.soldAt,
+            row.location, row.baitId,
+            row.gameYear, row.season, row.weather, row.gameDay, row.gameTime,
+            row.worldDayIndex,
+            row.requestId, row.caughtAt,
+        ],
+    };
+}
+function upsertCodex(row) {
+    return {
+        sql: `INSERT INTO codex_fish
+            (player_id, species_id, first_caught_at, catch_count,
+             max_weight_g, max_grade)
+          VALUES (?, ?, ?, 1, ?, ?)
+          ON CONFLICT(player_id, species_id) DO UPDATE SET
+            catch_count = catch_count + 1,
+            max_weight_g = MAX(max_weight_g, excluded.max_weight_g),
+            max_grade = CASE
+              WHEN excluded.max_weight_g > max_weight_g
+                THEN excluded.max_grade
+              ELSE max_grade
+            END`,
+        params: [row.playerId, row.speciesId, row.firstCaughtAt, row.maxWeightG, row.maxGrade],
+    };
+}
+function insertActionLog(row) {
+    return {
+        sql: `INSERT INTO action_logs (
+            player_id, actor_id, action, location, summary, details,
+            game_year, season, game_day, game_time, world_day_index,
+            created_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        params: [
+            row.playerId, row.actorId, row.action, row.location, row.summary, row.details,
+            row.gameYear, row.season, row.gameDay, row.gameTime, row.worldDayIndex, row.createdAt,
+        ],
+    };
+}
+function insertWalletTransaction(row) {
+    return {
+        sql: `INSERT INTO wallet_transactions (
+            player_id, actor_id, delta, balance_after, reason,
+            counterparty, note,
+            game_year, season, game_day, game_time, world_day_index,
+            created_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        params: [
+            row.playerId, row.actorId, row.delta, row.balanceAfter, row.reason,
+            row.counterparty, row.note,
+            row.gameYear, row.season, row.gameDay, row.gameTime, row.worldDayIndex,
+            row.createdAt,
+        ],
+    };
+}
+function insertActionRequest(row) {
+    return {
+        sql: `INSERT INTO action_requests
+            (request_id, actor_id, player_id, action, result_json,
+             state_revision_before, created_at)
+          VALUES (?,?,?,?,?,?,?)`,
+        params: [
+            row.requestId,
+            row.actorId,
+            row.playerId,
+            row.action,
+            row.resultJson,
+            row.stateRevisionBefore,
+            row.createdAt,
+        ],
+    };
+}
+function insertPlayerAchievement(playerId, achievementId, nowMs, worldDayIndex, gameTime) {
+    return {
+        sql: `INSERT INTO player_achievements
+            (player_id, achievement_id, unlocked_at, world_day_index, game_time)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(player_id, achievement_id) DO NOTHING`,
+        params: [playerId, achievementId, nowMs, worldDayIndex, gameTime],
+    };
+}
+function sellAllSellableFish(playerId, nowMs) {
+    return {
+        sql: `UPDATE fish_catches
+          SET status = 'sold', sold_at = ?
+          WHERE player_id = ?
+            AND status = 'inventory'
+            AND is_locked = 0`,
+        params: [nowMs, playerId],
+    };
+}
+function markFishSold(playerId, ids, nowMs) {
+    if (ids.length === 0)
+        throw new Error("markFishSold: ids must not be empty");
+    const placeholders = ids.map(() => "?").join(",");
+    return {
+        sql: `UPDATE fish_catches
+          SET status = 'sold', sold_at = ?
+          WHERE player_id = ?
+            AND id IN (${placeholders})
+            AND status = 'inventory'
+            AND is_locked = 0`,
+        params: [nowMs, playerId, ...ids],
+    };
+}
+
+},
+"./rng": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.cryptoRng = cryptoRng;
+exports.seededRng = seededRng;
+/** 生产环境 RNG：Web Crypto，返回 [0, 1)。 */
+function cryptoRng() {
+    const buf = new Uint32Array(1);
+    return () => {
+        crypto.getRandomValues(buf);
+        return buf[0] / 0x1_0000_0000;
+    };
+}
+/** 确定性 RNG（mulberry32），仅用于测试。 */
+function seededRng(seed) {
+    let s = seed >>> 0;
+    return () => {
+        s = (s + 0x6d2b79f5) >>> 0;
+        let t = s;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 0x1_0000_0000;
+    };
+}
+
+},
+"./world": (module, exports, require) => {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.worldDayIndex = exports.NIGHT_START = exports.DUSK_START = exports.DAY_START = exports.DAWN_START = exports.DAY_BOUNDARY_MINUTE = exports.MINUTES_PER_DAY = exports.SEASONS_PER_YEAR = exports.DAYS_PER_SEASON = exports.SEASON_INDEX = exports.SEASON_ORDER = void 0;
+exports.getTimeOfDay = getTimeOfDay;
+exports.rollWeather = rollWeather;
+exports.advanceTime = advanceTime;
+exports.sleepToMorning = sleepToMorning;
+exports.minutesToNextDayBoundary = minutesToNextDayBoundary;
+const db_1 = require("./db");
+Object.defineProperty(exports, "worldDayIndex", { enumerable: true, get: function () { return db_1.worldDayIndex; } });
+exports.SEASON_ORDER = [
+    "spring",
+    "summer",
+    "autumn",
+    "winter",
+];
+exports.SEASON_INDEX = {
+    spring: 0,
+    summer: 1,
+    autumn: 2,
+    winter: 3,
+};
+exports.DAYS_PER_SEASON = 28;
+exports.SEASONS_PER_YEAR = 4;
+exports.MINUTES_PER_DAY = 1440;
+/** 05:00 是游戏日边界；当前也恰好是 dawn 的开始。 */
+exports.DAY_BOUNDARY_MINUTE = 5 * 60;
+exports.DAWN_START = exports.DAY_BOUNDARY_MINUTE;
+exports.DAY_START = 8 * 60;
+exports.DUSK_START = 17 * 60;
+exports.NIGHT_START = 19 * 60;
+function getTimeOfDay(minuteOfDay) {
+    const m = ((minuteOfDay % exports.MINUTES_PER_DAY) + exports.MINUTES_PER_DAY) % exports.MINUTES_PER_DAY;
+    if (m >= exports.DAWN_START && m < exports.DAY_START)
+        return "dawn";
+    if (m >= exports.DAY_START && m < exports.DUSK_START)
+        return "day";
+    if (m >= exports.DUSK_START && m < exports.NIGHT_START)
+        return "dusk";
+    return "night";
+}
+const WEATHER_TABLE = {
+    spring: {
+        sunny: 40, cloudy: 25, light_rain: 20, rain: 10,
+        thunder: 5, snow: 0, fog: 0,
+    },
+    summer: {
+        sunny: 50, cloudy: 20, light_rain: 0, rain: 15,
+        thunder: 15, snow: 0, fog: 0,
+    },
+    autumn: {
+        sunny: 30, cloudy: 25, light_rain: 0, rain: 30,
+        thunder: 0, snow: 0, fog: 15,
+    },
+    winter: {
+        sunny: 35, cloudy: 25, light_rain: 0, rain: 0,
+        thunder: 0, snow: 40, fog: 0,
+    },
+};
+function nextRandom(rng, label) {
+    const value = rng();
+    if (!Number.isFinite(value) || value < 0 || value >= 1) {
+        throw new Error(`${label}: rng must return a finite value in [0,1)`);
+    }
+    return value;
+}
+function rollWeather(season, rng) {
+    const table = WEATHER_TABLE[season];
+    const entries = Object.entries(table).filter(([, w]) => w > 0);
+    const total = entries.reduce((sum, [, w]) => sum + w, 0);
+    if (total <= 0)
+        return "sunny";
+    let r = nextRandom(rng, "rollWeather") * total;
+    for (const [w, weight] of entries) {
+        r -= weight;
+        if (r < 0)
+            return w;
+    }
+    return entries[entries.length - 1][0];
+}
+/**
+ * 自本游戏日 05:00 起已过去的分钟数，范围 [0,1439]。
+ * 05:00→0；12:00→420；23:59→1139；00:00→1140；04:59→1439。
+ */
+function minutesSinceDayBoundary(gameMinuteOfDay) {
+    return (((gameMinuteOfDay - exports.DAY_BOUNDARY_MINUTE) % exports.MINUTES_PER_DAY +
+        exports.MINUTES_PER_DAY) %
+        exports.MINUTES_PER_DAY);
+}
+/**
+ * 推进世界时间。新游戏日边界为 05:00；00:00 不换 game_day。
+ */
+function advanceTime(state, deltaMinutes, rng) {
+    if (!Number.isFinite(deltaMinutes) || deltaMinutes < 0) {
+        throw new Error("advanceTime: deltaMinutes must be a finite number >= 0");
+    }
+    if (!Number.isInteger(deltaMinutes)) {
+        throw new Error("advanceTime: deltaMinutes must be an integer");
+    }
+    const since = minutesSinceDayBoundary(state.gameMinuteOfDay);
+    const total = since + deltaMinutes;
+    const daysPassed = Math.floor(total / exports.MINUTES_PER_DAY);
+    const newSince = total % exports.MINUTES_PER_DAY;
+    const newMinute = (exports.DAY_BOUNDARY_MINUTE + newSince) % exports.MINUTES_PER_DAY;
+    let newGameDay = state.gameDay;
+    let newSeason = state.season;
+    let newYear = state.year;
+    let seasonsPassed = 0;
+    let yearsPassed = 0;
+    if (daysPassed > 0) {
+        let cursor = newGameDay - 1 + daysPassed;
+        while (cursor >= exports.DAYS_PER_SEASON) {
+            cursor -= exports.DAYS_PER_SEASON;
+            seasonsPassed += 1;
+            const idx = exports.SEASON_INDEX[newSeason];
+            const nextIdx = (idx + 1) % exports.SEASONS_PER_YEAR;
+            newSeason = exports.SEASON_ORDER[nextIdx];
+            if (nextIdx === 0) {
+                newYear += 1;
+                yearsPassed += 1;
+            }
+        }
+        newGameDay = cursor + 1;
+    }
+    const newWorldDayIndex = (0, db_1.worldDayIndex)(newYear, newSeason, newGameDay);
+    let weather = state.weather;
+    let weatherLockedFor = state.weatherLockedForWorldDay;
+    let weatherRerolled = false;
+    if (newWorldDayIndex !== state.weatherLockedForWorldDay) {
+        weather = rollWeather(newSeason, rng);
+        weatherLockedFor = newWorldDayIndex;
+        weatherRerolled = true;
+    }
+    return {
+        state: {
+            worldDayIndex: newWorldDayIndex,
+            gameDay: newGameDay,
+            season: newSeason,
+            year: newYear,
+            gameMinuteOfDay: newMinute,
+            weather,
+            weatherLockedForWorldDay: weatherLockedFor,
+        },
+        daysPassed,
+        seasonsPassed,
+        yearsPassed,
+        weatherRerolled,
+    };
+}
+/**
+ * Batch 3D: minutes until the next not-yet-reached 05:00.
+ * Equivalent to the frozen formula and intentionally reuses the sealed
+ * 05:00 day-boundary model.
+ */
+function minutesToNextDayBoundary(minuteOfDay) {
+    const since = minutesSinceDayBoundary(minuteOfDay);
+    return exports.MINUTES_PER_DAY - since;
+}
+/**
+ * 睡到下一个尚未到来的 05:00。
+ * 03:00→05:00(+2h，跨 game-day boundary)
+ * 12:00→次日05:00；23:50→次日05:00；05:00→次日05:00。
+ */
+function sleepToMorning(state, rng) {
+    const since = minutesSinceDayBoundary(state.gameMinuteOfDay);
+    const delta = exports.MINUTES_PER_DAY - since;
+    return advanceTime(state, delta, rng);
+}
+
+}
+};
+
+const __cache = Object.create(null);
+function __require(id) {
+  if (__cache[id]) return __cache[id].exports;
+  const factory = __modules[id];
+  if (!factory) throw new Error('Module not found: ' + id);
+  const module = { exports: {} };
+  __cache[id] = module;
+  factory(module, module.exports, __require);
+  return module.exports;
+}
+
+const __entry = __require('./index');
+export default __entry.default;
